@@ -1,0 +1,152 @@
+{
+  "enabled": true,
+  "config_dir": "/etc/versitygw/multitenant",
+  "base_mount_path": "/var/lib/versitygw/mounts",
+  "defaults": {
+    "backend_type": "posix",
+    "storage_quota": 107374182400,
+    "bandwidth_limit": 0,
+    "max_buckets": 100,
+    "max_objects": 1000000,
+    "backend_config": {},
+    "permissions": ["read", "write", "delete"]
+  },
+  "backends": {
+    "posix": {
+      "type": "posix",
+      "name": "POSIX File System",
+      "description": "Local POSIX-compliant file system",
+      "enabled": true,
+      "config": {},
+      "max_users": 1000,
+      "max_storage": 10995116277760,
+      "max_bandwidth": 0,
+      "performance": {
+        "read_buffer_size": 65536,
+        "write_buffer_size": 65536,
+        "max_concurrency": 10,
+        "cache_size": 104857600,
+        "cache_ttl": "5m0s",
+        "enable_compression": false
+      }
+    },
+    "cephfs": {
+      "type": "cephfs",
+      "name": "Ceph File System", 
+      "description": "Ceph distributed file system",
+      "enabled": true,
+      "config": {
+        "monitor_addresses": ["mon1:6789", "mon2:6789", "mon3:6789"],
+        "username": "admin",
+        "filesystem": "cephfs"
+      },
+      "max_users": 500,
+      "max_storage": 109951162777600,
+      "max_bandwidth": 0,
+      "performance": {
+        "read_buffer_size": 1048576,
+        "write_buffer_size": 1048576,
+        "max_concurrency": 20,
+        "cache_size": 1073741824,
+        "cache_ttl": "10m0s",
+        "enable_compression": true
+      }
+    },
+    "lustre": {
+      "type": "lustre",
+      "name": "Lustre File System",
+      "description": "High-performance parallel file system",
+      "enabled": true,
+      "config": {
+        "mgs_nodes": ["mgs1", "mgs2"],
+        "filesystem": "lustre",
+        "stripe_count": 4,
+        "stripe_size": 1048576
+      },
+      "max_users": 200,
+      "max_storage": 549755813888000,
+      "max_bandwidth": 0,
+      "performance": {
+        "read_buffer_size": 4194304,
+        "write_buffer_size": 4194304,
+        "max_concurrency": 50,
+        "cache_size": 4294967296,
+        "cache_ttl": "15m0s",
+        "enable_compression": false
+      }
+    },
+    "nfs": {
+      "type": "nfs",
+      "name": "Network File System",
+      "description": "NFS network attached storage", 
+      "enabled": true,
+      "config": {
+        "server_address": "nfs-server.example.com",
+        "export_path": "/exports",
+        "version": "nfs4",
+        "options": ["rw", "sync"]
+      },
+      "max_users": 300,
+      "max_storage": 54975581388800,
+      "max_bandwidth": 0,
+      "performance": {
+        "read_buffer_size": 524288,
+        "write_buffer_size": 524288,
+        "max_concurrency": 15,
+        "cache_size": 536870912,
+        "cache_ttl": "5m0s",
+        "enable_compression": false
+      }
+    },
+    "minio": {
+      "type": "minio",
+      "name": "MinIO Object Storage",
+      "description": "MinIO S3-compatible object storage",
+      "enabled": true,
+      "config": {
+        "endpoint": "http://minio.example.com:9000",
+        "access_key": "minioadmin",
+        "secret_key": "minioadmin",
+        "region": "us-east-1",
+        "bucket_prefix": "vgw",
+        "ssl": false,
+        "use_path_style": true
+      },
+      "max_users": 1000,
+      "max_storage": 1099511627776000,
+      "max_bandwidth": 0,
+      "performance": {
+        "read_buffer_size": 1048576,
+        "write_buffer_size": 1048576,
+        "max_concurrency": 30,
+        "cache_size": 2147483648,
+        "cache_ttl": "10m0s",
+        "enable_compression": true
+      }
+    }
+  },
+  "resource_limits": {
+    "max_concurrent_users": 1000,
+    "max_mount_points": 500,
+    "mount_timeout": "30s",
+    "unmount_timeout": "15s",
+    "idle_timeout": "30m0s"
+  },
+  "security": {
+    "enable_encryption": true,
+    "encryption_algorithm": "AES-256-GCM",
+    "require_ssl": false,
+    "allowed_networks": ["0.0.0.0/0"],
+    "max_request_size": 5368709120,
+    "enable_audit_log": true,
+    "audit_log_path": "/var/log/versitygw/audit.log"
+  },
+  "monitoring": {
+    "enable_metrics": true,
+    "metrics_interval": "30s",
+    "metrics_endpoint": "/metrics",
+    "enable_health_check": true,
+    "health_check_path": "/health",
+    "log_level": "info"
+  }
+}
