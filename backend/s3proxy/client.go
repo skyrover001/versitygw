@@ -17,6 +17,7 @@ package s3proxy
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"net/http"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -48,7 +49,12 @@ func (s *S3Proxy) getClientWithCtx(ctx context.Context) (*s3.Client, error) {
 }
 
 func (s *S3Proxy) getConfig(ctx context.Context, access, secret string) (aws.Config, error) {
-	creds := credentials.NewStaticCredentialsProvider(access, secret, "")
+	if (access != "" && secret == "") || (access == "" && secret != "") {
+		return aws.Config{}, fmt.Errorf("both access and secret must be set or none at all")
+	}
+	if s.anonymousCredentials && access != "" {
+		return aws.Config{}, fmt.Errorf("anonymous credentials cannot be used with access and secret")
+	}
 
 	tr := &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: s.sslSkipVerify},
@@ -57,13 +63,23 @@ func (s *S3Proxy) getConfig(ctx context.Context, access, secret string) (aws.Con
 
 	opts := []func(*config.LoadOptions) error{
 		config.WithRegion(s.awsRegion),
-		config.WithCredentialsProvider(creds),
 		config.WithHTTPClient(client),
+	}
+
+	if access != "" {
+		opts = append(opts, config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(access, secret, "")))
+	} else if s.anonymousCredentials {
+		opts = append(opts, config.WithCredentialsProvider(aws.AnonymousCredentials{}))
 	}
 
 	if s.disableChecksum {
 		opts = append(opts,
 			config.WithAPIOptions([]func(*middleware.Stack) error{v4.SwapComputePayloadSHA256ForUnsignedPayloadMiddleware}))
+	}
+
+	if s.disableDataIntegrityCheck {
+		opts = append(opts,
+			config.WithRequestChecksumCalculation(aws.RequestChecksumCalculationWhenRequired))
 	}
 
 	if s.debug {

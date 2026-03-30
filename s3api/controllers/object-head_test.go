@@ -52,12 +52,29 @@ func TestS3ApiController_HeadObject(t *testing.T) {
 			},
 		},
 		{
+			name: "invalid versionId",
+			input: testInput{
+				locals: defaultLocals,
+				queries: map[string]string{
+					"versionId": "invalid_versionId",
+				},
+			},
+			output: testOutput{
+				response: &Response{
+					MetaOpts: &MetaOptions{
+						BucketOwner: "root",
+					},
+				},
+				err: s3err.GetAPIError(s3err.ErrInvalidVersionId),
+			},
+		},
+		{
 			name: "invalid part number",
 			input: testInput{
 				locals: defaultLocals,
 				queries: map[string]string{
 					"partNumber": "-4",
-					"versionId":  "id",
+					"versionId":  "01BX5ZZKBKACTAV9WEVGEMMVRZ",
 				},
 			},
 			output: testOutput{
@@ -147,6 +164,7 @@ func TestS3ApiController_HeadObject(t *testing.T) {
 						"x-amz-checksum-type":                 nil,
 						"x-amz-object-lock-retain-until-date": nil,
 						"Last-Modified":                       nil,
+						"x-amz-tagging-count":                 nil,
 						"Content-Type":                        utils.GetStringPtr("application/xml"),
 						"Content-Length":                      utils.GetStringPtr("100"),
 					},

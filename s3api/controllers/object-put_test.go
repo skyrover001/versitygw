@@ -23,6 +23,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/oklog/ulid/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/versity/versitygw/auth"
 	"github.com/versity/versitygw/s3api/utils"
@@ -45,6 +46,8 @@ func TestS3ApiController_PutObjectTagging(t *testing.T) {
 		})
 	assert.NoError(t, err)
 
+	versionId := ulid.Make().String()
+
 	tests := []struct {
 		name   string
 		input  testInput
@@ -62,6 +65,23 @@ func TestS3ApiController_PutObjectTagging(t *testing.T) {
 					},
 				},
 				err: s3err.GetAPIError(s3err.ErrAccessDenied),
+			},
+		},
+		{
+			name: "invalid versionId",
+			input: testInput{
+				locals: defaultLocals,
+				queries: map[string]string{
+					"versionId": "invalid_versionId",
+				},
+			},
+			output: testOutput{
+				response: &Response{
+					MetaOpts: &MetaOptions{
+						BucketOwner: "root",
+					},
+				},
+				err: s3err.GetAPIError(s3err.ErrInvalidVersionId),
 			},
 		},
 		{
@@ -85,9 +105,15 @@ func TestS3ApiController_PutObjectTagging(t *testing.T) {
 				locals: defaultLocals,
 				beErr:  s3err.GetAPIError(s3err.ErrNoSuchBucket),
 				body:   validTaggingBody,
+				queries: map[string]string{
+					"versionId": versionId,
+				},
 			},
 			output: testOutput{
 				response: &Response{
+					Headers: map[string]*string{
+						"x-amz-version-id": &versionId,
+					},
 					MetaOpts: &MetaOptions{
 						BucketOwner: "root",
 						EventName:   s3event.EventObjectTaggingPut,
@@ -101,9 +127,15 @@ func TestS3ApiController_PutObjectTagging(t *testing.T) {
 			input: testInput{
 				locals: defaultLocals,
 				body:   validTaggingBody,
+				queries: map[string]string{
+					"versionId": versionId,
+				},
 			},
 			output: testOutput{
 				response: &Response{
+					Headers: map[string]*string{
+						"x-amz-version-id": &versionId,
+					},
 					MetaOpts: &MetaOptions{
 						BucketOwner: "root",
 						EventName:   s3event.EventObjectTaggingPut,
@@ -115,7 +147,7 @@ func TestS3ApiController_PutObjectTagging(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			be := &BackendMock{
-				PutObjectTaggingFunc: func(contextMoqParam context.Context, bucket, object string, tags map[string]string) error {
+				PutObjectTaggingFunc: func(contextMoqParam context.Context, bucket, object, versionId string, tags map[string]string) error {
 					return tt.input.beErr
 				},
 				GetBucketPolicyFunc: func(contextMoqParam context.Context, bucket string) ([]byte, error) {
@@ -133,8 +165,9 @@ func TestS3ApiController_PutObjectTagging(t *testing.T) {
 				tt.output.response,
 				tt.output.err,
 				ctxInputs{
-					locals: tt.input.locals,
-					body:   tt.input.body,
+					locals:  tt.input.locals,
+					body:    tt.input.body,
+					queries: tt.input.queries,
 				})
 		})
 	}
@@ -172,6 +205,23 @@ func TestS3ApiController_PutObjectRetention(t *testing.T) {
 			},
 		},
 		{
+			name: "invalid versionId",
+			input: testInput{
+				locals: defaultLocals,
+				queries: map[string]string{
+					"versionId": "invalid_versionId",
+				},
+			},
+			output: testOutput{
+				response: &Response{
+					MetaOpts: &MetaOptions{
+						BucketOwner: "root",
+					},
+				},
+				err: s3err.GetAPIError(s3err.ErrInvalidVersionId),
+			},
+		},
+		{
 			name: "invalid request body",
 			input: testInput{
 				locals: defaultLocals,
@@ -187,11 +237,28 @@ func TestS3ApiController_PutObjectRetention(t *testing.T) {
 			},
 		},
 		{
+			name: "retention put not allowed",
+			input: testInput{
+				locals:       defaultLocals,
+				body:         validRetentionBody,
+				extraMockErr: s3err.GetAPIError(s3err.ErrAccessDenied),
+			},
+			output: testOutput{
+				response: &Response{
+					MetaOpts: &MetaOptions{
+						BucketOwner: "root",
+					},
+				},
+				err: s3err.GetAPIError(s3err.ErrAccessDenied),
+			},
+		},
+		{
 			name: "backend returns error",
 			input: testInput{
-				locals: defaultLocals,
-				beErr:  s3err.GetAPIError(s3err.ErrNoSuchBucket),
-				body:   validRetentionBody,
+				locals:       defaultLocals,
+				beErr:        s3err.GetAPIError(s3err.ErrNoSuchBucket),
+				body:         validRetentionBody,
+				extraMockErr: s3err.GetAPIError(s3err.ErrNoSuchObjectLockConfiguration),
 			},
 			output: testOutput{
 				response: &Response{
@@ -203,46 +270,11 @@ func TestS3ApiController_PutObjectRetention(t *testing.T) {
 			},
 		},
 		{
-			name: "success bypass GetBucketPolicy fails",
+			name: "successful response",
 			input: testInput{
 				locals:       defaultLocals,
 				body:         validRetentionBody,
-				extraMockErr: s3err.GetAPIError(s3err.ErrAccessDenied),
-				headers: map[string]string{
-					"X-Amz-Bypass-Governance-Retention": "true",
-				},
-			},
-			output: testOutput{
-				response: &Response{
-					MetaOpts: &MetaOptions{
-						BucketOwner: "root",
-					},
-				},
-			},
-		},
-		{
-			name: "success bypass VerifyBucketPolicy fails",
-			input: testInput{
-				locals:        defaultLocals,
-				body:          validRetentionBody,
-				extraMockResp: []byte("invalid_policy"),
-				headers: map[string]string{
-					"X-Amz-Bypass-Governance-Retention": "true",
-				},
-			},
-			output: testOutput{
-				response: &Response{
-					MetaOpts: &MetaOptions{
-						BucketOwner: "root",
-					},
-				},
-			},
-		},
-		{
-			name: "successful response",
-			input: testInput{
-				locals: defaultLocals,
-				body:   validRetentionBody,
+				extraMockErr: s3err.GetAPIError(s3err.ErrNoSuchObjectLockConfiguration),
 			},
 			output: testOutput{
 				response: &Response{
@@ -256,15 +288,14 @@ func TestS3ApiController_PutObjectRetention(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			be := &BackendMock{
-				PutObjectRetentionFunc: func(contextMoqParam context.Context, bucket, object, versionId string, bypass bool, retention []byte) error {
+				PutObjectRetentionFunc: func(contextMoqParam context.Context, bucket, object, versionId string, retention []byte) error {
 					return tt.input.beErr
 				},
 				GetBucketPolicyFunc: func(contextMoqParam context.Context, bucket string) ([]byte, error) {
-					if tt.input.extraMockResp == nil {
-						return nil, tt.input.extraMockErr
-					} else {
-						return tt.input.extraMockResp.([]byte), tt.input.extraMockErr
-					}
+					return nil, s3err.GetAPIError(s3err.ErrAccessDenied)
+				},
+				GetObjectRetentionFunc: func(contextMoqParam context.Context, bucket, object, versionId string) ([]byte, error) {
+					return nil, tt.input.extraMockErr
 				},
 			}
 
@@ -281,6 +312,7 @@ func TestS3ApiController_PutObjectRetention(t *testing.T) {
 					locals:  tt.input.locals,
 					body:    tt.input.body,
 					headers: tt.input.headers,
+					queries: tt.input.queries,
 				})
 		})
 	}
@@ -315,6 +347,23 @@ func TestS3ApiController_PutObjectLegalHold(t *testing.T) {
 					},
 				},
 				err: s3err.GetAPIError(s3err.ErrAccessDenied),
+			},
+		},
+		{
+			name: "invalid request body",
+			input: testInput{
+				locals: defaultLocals,
+				queries: map[string]string{
+					"versionId": "invalid_versionId",
+				},
+			},
+			output: testOutput{
+				response: &Response{
+					MetaOpts: &MetaOptions{
+						BucketOwner: "root",
+					},
+				},
+				err: s3err.GetAPIError(s3err.ErrInvalidVersionId),
 			},
 		},
 		{
@@ -399,8 +448,9 @@ func TestS3ApiController_PutObjectLegalHold(t *testing.T) {
 				tt.output.response,
 				tt.output.err,
 				ctxInputs{
-					locals: tt.input.locals,
-					body:   tt.input.body,
+					locals:  tt.input.locals,
+					body:    tt.input.body,
+					queries: tt.input.queries,
 				})
 		})
 	}
@@ -599,6 +649,26 @@ func TestS3ApiController_UploadPartCopy(t *testing.T) {
 			},
 		},
 		{
+			name: "invalid copy source: invalid versionId",
+			input: testInput{
+				locals: defaultLocals,
+				headers: map[string]string{
+					"X-Amz-Copy-Source": "bucket/object?versionId=invalid_versionId",
+				},
+				queries: map[string]string{
+					"partNumber": "2",
+				},
+			},
+			output: testOutput{
+				response: &Response{
+					MetaOpts: &MetaOptions{
+						BucketOwner: "root",
+					},
+				},
+				err: s3err.GetAPIError(s3err.ErrInvalidVersionId),
+			},
+		},
+		{
 			name: "invalid copy source",
 			input: testInput{
 				locals: defaultLocals,
@@ -616,6 +686,27 @@ func TestS3ApiController_UploadPartCopy(t *testing.T) {
 					},
 				},
 				err: s3err.GetAPIError(s3err.ErrInvalidCopySourceEncoding),
+			},
+		},
+		{
+			name: "non empty request body",
+			input: testInput{
+				locals: defaultLocals,
+				headers: map[string]string{
+					"X-Amz-Copy-Source": "bucket/object",
+				},
+				queries: map[string]string{
+					"partNumber": "2",
+				},
+				body: []byte("body"),
+			},
+			output: testOutput{
+				response: &Response{
+					MetaOpts: &MetaOptions{
+						BucketOwner: "root",
+					},
+				},
+				err: s3err.GetAPIError(s3err.ErrNonEmptyRequestBody),
 			},
 		},
 		{
@@ -715,6 +806,7 @@ func TestS3ApiController_UploadPartCopy(t *testing.T) {
 					locals:  tt.input.locals,
 					headers: tt.input.headers,
 					queries: tt.input.queries,
+					body:    tt.input.body,
 				})
 		})
 	}
@@ -837,6 +929,59 @@ func TestS3ApiController_CopyObject(t *testing.T) {
 			},
 		},
 		{
+			name: "invalid copy source: versionId",
+			input: testInput{
+				locals: defaultLocals,
+				headers: map[string]string{
+					"X-Amz-Copy-Source": "bucket/object?versionId=invalid_versionId",
+				},
+			},
+			output: testOutput{
+				response: &Response{
+					MetaOpts: &MetaOptions{
+						BucketOwner: "root",
+					},
+				},
+				err: s3err.GetAPIError(s3err.ErrInvalidVersionId),
+			},
+		},
+		{
+			name: "non empty request body",
+			input: testInput{
+				locals: defaultLocals,
+				headers: map[string]string{
+					"X-Amz-Copy-Source": "bucket/object",
+				},
+				body: []byte("body"),
+			},
+			output: testOutput{
+				response: &Response{
+					MetaOpts: &MetaOptions{
+						BucketOwner: "root",
+					},
+				},
+				err: s3err.GetAPIError(s3err.ErrNonEmptyRequestBody),
+			},
+		},
+		{
+			name: "invalid metadata header",
+			input: testInput{
+				locals: defaultLocals,
+				headers: map[string]string{
+					"X-Amz-Copy-Source": "bucket/object",
+					"x-amz-meta-key":    strings.Repeat("b", 2048),
+				},
+			},
+			output: testOutput{
+				response: &Response{
+					MetaOpts: &MetaOptions{
+						BucketOwner: "root",
+					},
+				},
+				err: s3err.GetAPIError(s3err.ErrMetadataTooLarge),
+			},
+		},
+		{
 			name: "invalid metadata directive",
 			input: testInput{
 				locals: defaultLocals,
@@ -911,6 +1056,24 @@ func TestS3ApiController_CopyObject(t *testing.T) {
 			},
 		},
 		{
+			name: "object is locked",
+			input: testInput{
+				locals: defaultLocals,
+				headers: map[string]string{
+					"X-Amz-Copy-Source": "bucket/object",
+				},
+				extraMockErr: s3err.GetAPIError(s3err.ErrObjectLocked),
+			},
+			output: testOutput{
+				response: &Response{
+					MetaOpts: &MetaOptions{
+						BucketOwner: "root",
+					},
+				},
+				err: s3err.GetAPIError(s3err.ErrObjectLocked),
+			},
+		},
+		{
 			name: "backend returns error",
 			input: testInput{
 				locals: defaultLocals,
@@ -919,6 +1082,7 @@ func TestS3ApiController_CopyObject(t *testing.T) {
 				headers: map[string]string{
 					"X-Amz-Copy-Source": "bucket/object",
 				},
+				extraMockErr: s3err.GetAPIError(s3err.ErrObjectLockConfigurationNotFound),
 			},
 			output: testOutput{
 				response: &Response{
@@ -949,6 +1113,7 @@ func TestS3ApiController_CopyObject(t *testing.T) {
 						ETag: utils.GetStringPtr("ETag"),
 					},
 				},
+				extraMockErr: s3err.GetAPIError(s3err.ErrObjectLockConfigurationNotFound),
 			},
 			output: testOutput{
 				response: &Response{
@@ -978,6 +1143,12 @@ func TestS3ApiController_CopyObject(t *testing.T) {
 				GetBucketPolicyFunc: func(contextMoqParam context.Context, bucket string) ([]byte, error) {
 					return nil, s3err.GetAPIError(s3err.ErrAccessDenied)
 				},
+				GetBucketVersioningFunc: func(contextMoqParam context.Context, bucket string) (s3response.GetBucketVersioningOutput, error) {
+					return s3response.GetBucketVersioningOutput{}, s3err.GetAPIError(s3err.ErrNotImplemented)
+				},
+				GetObjectLockConfigurationFunc: func(contextMoqParam context.Context, bucket string) ([]byte, error) {
+					return nil, tt.input.extraMockErr
+				},
 			}
 
 			ctrl := S3ApiController{
@@ -992,6 +1163,7 @@ func TestS3ApiController_CopyObject(t *testing.T) {
 				ctxInputs{
 					locals:  tt.input.locals,
 					headers: tt.input.headers,
+					body:    tt.input.body,
 				})
 		})
 	}
@@ -1052,6 +1224,24 @@ func TestS3ApiController_PutObject(t *testing.T) {
 					},
 				},
 				err: s3err.GetAPIError(s3err.ErrInvalidRequest),
+			},
+		},
+		{
+			name: "invalid metadata header",
+			input: testInput{
+				locals:       defaultLocals,
+				extraMockErr: s3err.GetAPIError(s3err.ErrObjectLockConfigurationNotFound),
+				headers: map[string]string{
+					"x-amz-meta-something": strings.Repeat("c", 2050),
+				},
+			},
+			output: testOutput{
+				response: &Response{
+					MetaOpts: &MetaOptions{
+						BucketOwner: "root",
+					},
+				},
+				err: s3err.GetAPIError(s3err.ErrMetadataTooLarge),
 			},
 		},
 		{
@@ -1192,6 +1382,9 @@ func TestS3ApiController_PutObject(t *testing.T) {
 				},
 				GetObjectLockConfigurationFunc: func(contextMoqParam context.Context, bucket string) ([]byte, error) {
 					return nil, tt.input.extraMockErr
+				},
+				GetBucketVersioningFunc: func(contextMoqParam context.Context, bucket string) (s3response.GetBucketVersioningOutput, error) {
+					return s3response.GetBucketVersioningOutput{}, s3err.GetAPIError(s3err.ErrNotImplemented)
 				},
 			}
 

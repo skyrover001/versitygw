@@ -67,7 +67,10 @@ func ParsePreconditionMatchHeaders(ctx *fiber.Ctx, opts ...preconditionOpt) (*st
 	if cfg.withCopySource {
 		prefix = "X-Amz-Copy-Source-"
 	}
-	return GetStringPtr(ctx.Get(prefix + "If-Match")), GetStringPtr(ctx.Get(prefix + "If-None-Match"))
+
+	ifMatch := TrimQuotes(ctx.Get(prefix + "If-Match"))
+	ifNoneMatch := TrimQuotes(ctx.Get(prefix + "If-None-Match"))
+	return GetStringPtr(ifMatch), GetStringPtr(ifNoneMatch)
 }
 
 // ParsePreconditionDateHeaders parses the "If-Modified-Since" and "If-Unmodified-Since"
@@ -128,6 +131,9 @@ func ParsePreconditionDateHeader(date string) *time.Time {
 // if parsing fails, returns nil
 func ParseIfMatchSize(ctx *fiber.Ctx) *int64 {
 	ifMatchSizeHdr := ctx.Get("x-amz-if-match-size")
+	if ifMatchSizeHdr == "" {
+		return nil
+	}
 	ifMatchSize, err := strconv.ParseInt(ifMatchSizeHdr, 10, 64)
 	if err != nil {
 		debuglogger.Logf("failed to parse 'x-amz-if-match-size': %s", ifMatchSizeHdr)
@@ -135,4 +141,16 @@ func ParseIfMatchSize(ctx *fiber.Ctx) *int64 {
 	}
 
 	return &ifMatchSize
+}
+
+func TrimQuotes(str string) string {
+	if len(str) < 2 {
+		return str
+	}
+
+	if str[0] == str[len(str)-1] && str[0] == '"' {
+		return str[1 : len(str)-1]
+	}
+
+	return str
 }

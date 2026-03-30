@@ -25,6 +25,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -100,6 +101,7 @@ func (p *Posix) openTmpFile(dir, bucket, obj string, size int64, acct auth.Accou
 	if doChown {
 		err := f.Chown(uid, gid)
 		if err != nil {
+			f.Close()
 			return nil, fmt.Errorf("set temp file ownership: %w", err)
 		}
 	}
@@ -140,6 +142,8 @@ func (p *Posix) openMkTemp(dir, bucket, obj string, size int64, dofalloc bool, u
 	if doChown {
 		err := f.Chown(uid, gid)
 		if err != nil {
+			f.Close()
+			os.Remove(f.Name())
 			return nil, fmt.Errorf("set temp file ownership: %w", err)
 		}
 	}
@@ -150,7 +154,7 @@ func (p *Posix) openMkTemp(dir, bucket, obj string, size int64, dofalloc bool, u
 func (tmp *tmpfile) falloc() error {
 	err := syscall.Fallocate(int(tmp.f.Fd()), 0, 0, tmp.size)
 	if err != nil {
-		return fmt.Errorf("fallocate: %v", err)
+		return fmt.Errorf("fallocate: %w", err)
 	}
 	return nil
 }
@@ -175,7 +179,7 @@ func (tmp *tmpfile) link() error {
 	}
 
 	if !tmp.isOTmp {
-		// O_TMPFILE not suported, use fallback
+		// O_TMPFILE not supported, use fallback
 		return tmp.fallbackLink()
 	}
 
@@ -230,9 +234,6 @@ func (tmp *tmpfile) link() error {
 
 func (tmp *tmpfile) fallbackLink() error {
 	tempname := tmp.f.Name()
-	// cleanup in case anything goes wrong, if rename succeeds then
-	// this will no longer exist
-	defer os.Remove(tempname)
 
 	// reset default file mode because CreateTemp uses 0600
 	tmp.f.Chmod(fs.FileMode(defaultFilePerm))
@@ -265,6 +266,9 @@ func (tmp *tmpfile) Write(b []byte) (int, error) {
 
 func (tmp *tmpfile) cleanup() {
 	tmp.f.Close()
+	if !strings.HasPrefix(tmp.f.Name(), procfddir) {
+		os.Remove(tmp.f.Name())
+	}
 }
 
 func (tmp *tmpfile) File() *os.File {

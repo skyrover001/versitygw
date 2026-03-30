@@ -466,7 +466,7 @@ func TestS3ApiController_PutBucketCors(t *testing.T) {
 	validBody, err := xml.Marshal(auth.CORSConfiguration{
 		Rules: []auth.CORSRule{
 			{
-				AllowedOrigins: []string{"*"},
+				AllowedOrigins: []auth.CORSOrigin{"*"},
 				AllowedMethods: []auth.CORSHTTPMethod{http.MethodPost},
 			},
 		},
@@ -476,7 +476,7 @@ func TestS3ApiController_PutBucketCors(t *testing.T) {
 	invalidCors, err := xml.Marshal(auth.CORSConfiguration{
 		Rules: []auth.CORSRule{
 			{
-				AllowedOrigins: []string{"origin"},
+				AllowedOrigins: []auth.CORSOrigin{"origin"},
 				AllowedMethods: []auth.CORSHTTPMethod{"invalid_method"},
 			},
 		},
@@ -526,22 +526,6 @@ func TestS3ApiController_PutBucketCors(t *testing.T) {
 					MetaOpts: &MetaOptions{BucketOwner: "root"},
 				},
 				err: s3err.GetUnsopportedCORSMethodErr("invalid_method"),
-			},
-		},
-		{
-			name: "invalid checksum algo",
-			input: testInput{
-				locals: defaultLocals,
-				body:   validBody,
-				headers: map[string]string{
-					"X-Amz-Sdk-Checksum-Algorithm": "invalid_algo",
-				},
-			},
-			output: testOutput{
-				response: &Response{
-					MetaOpts: &MetaOptions{BucketOwner: "root"},
-				},
-				err: s3err.GetAPIError(s3err.ErrInvalidChecksumAlgorithm),
 			},
 		},
 		{
@@ -657,7 +641,10 @@ func TestS3ApiController_PutBucketPolicy(t *testing.T) {
 			},
 			output: testOutput{
 				response: &Response{
-					MetaOpts: &MetaOptions{BucketOwner: "root"},
+					MetaOpts: &MetaOptions{
+						BucketOwner: "root",
+						Status:      http.StatusNoContent,
+					},
 				},
 				err: s3err.GetAPIError(s3err.ErrNoSuchBucket),
 			},
@@ -672,6 +659,7 @@ func TestS3ApiController_PutBucketPolicy(t *testing.T) {
 				response: &Response{
 					MetaOpts: &MetaOptions{
 						BucketOwner: "root",
+						Status:      http.StatusNoContent,
 					},
 				},
 			},
@@ -711,6 +699,11 @@ func TestS3ApiController_CreateBucket(t *testing.T) {
 		Role:   auth.RoleUser,
 	}
 
+	invLocConstBody, err := xml.Marshal(s3response.CreateBucketConfiguration{
+		LocationConstraint: utils.GetStringPtr("us-west-1"),
+	})
+	assert.NoError(t, err)
+
 	tests := []struct {
 		name   string
 		input  testInput
@@ -740,9 +733,60 @@ func TestS3ApiController_CreateBucket(t *testing.T) {
 			},
 			output: testOutput{
 				response: &Response{
-					MetaOpts: &MetaOptions{},
+					MetaOpts: &MetaOptions{
+						BucketOwner: adminAcc.Access,
+					},
 				},
 				err: s3err.GetAPIError(s3err.ErrInvalidBucketName),
+			},
+		},
+		{
+			name: "malformed body",
+			input: testInput{
+				locals: map[utils.ContextKey]any{
+					utils.ContextKeyAccount: adminAcc,
+				},
+				body: []byte("invalid_body"),
+			},
+			output: testOutput{
+				response: &Response{
+					MetaOpts: &MetaOptions{BucketOwner: adminAcc.Access},
+				},
+				err: s3err.GetAPIError(s3err.ErrMalformedXML),
+			},
+		},
+
+		{
+			name: "invalid canned acl",
+			input: testInput{
+				locals: map[utils.ContextKey]any{
+					utils.ContextKeyAccount: adminAcc,
+				},
+				headers: map[string]string{
+					"x-amz-acl": "invalid_acl",
+				},
+			},
+			output: testOutput{
+				response: &Response{
+					MetaOpts: &MetaOptions{BucketOwner: adminAcc.Access},
+				},
+				err: s3err.GetAPIError(s3err.ErrInvalidArgument),
+			},
+		},
+		{
+			name: "invalid location constraint",
+			input: testInput{
+				locals: map[utils.ContextKey]any{
+					utils.ContextKeyAccount: adminAcc,
+					utils.ContextKeyRegion:  "us-east-1",
+				},
+				body: invLocConstBody,
+			},
+			output: testOutput{
+				response: &Response{
+					MetaOpts: &MetaOptions{BucketOwner: adminAcc.Access},
+				},
+				err: s3err.GetAPIError(s3err.ErrInvalidLocationConstraint),
 			},
 		},
 		{
@@ -757,7 +801,9 @@ func TestS3ApiController_CreateBucket(t *testing.T) {
 			},
 			output: testOutput{
 				response: &Response{
-					MetaOpts: &MetaOptions{},
+					MetaOpts: &MetaOptions{
+						BucketOwner: adminAcc.Access,
+					},
 				},
 				err: s3err.APIError{
 					Code:           "InvalidArgument",
@@ -842,11 +888,16 @@ func TestS3ApiController_CreateBucket(t *testing.T) {
 				locals: map[utils.ContextKey]any{
 					utils.ContextKeyAccount: adminAcc,
 				},
+				bucket: "my-bucket",
 			},
 			output: testOutput{
 				response: &Response{
 					MetaOpts: &MetaOptions{
 						BucketOwner: adminAcc.Access,
+					},
+					Headers: map[string]*string{
+						"Location":         utils.GetStringPtr("/my-bucket"),
+						"x-amz-bucket-arn": utils.GetStringPtr("arn:aws:s3:::my-bucket"),
 					},
 				},
 			},
@@ -1059,7 +1110,7 @@ func TestS3ApiController_PutBucketAcl(t *testing.T) {
 						BucketOwner: "root",
 					},
 				},
-				err: s3err.GetAPIError(s3err.ErrInvalidRequest),
+				err: s3err.GetAPIError(s3err.ErrInvalidArgument),
 			},
 		},
 		{

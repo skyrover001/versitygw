@@ -15,98 +15,45 @@
 package s3api
 
 import (
-	"crypto/tls"
-	"reflect"
 	"testing"
 
 	"github.com/gofiber/fiber/v2"
-	"github.com/versity/versitygw/auth"
 	"github.com/versity/versitygw/backend"
-	"github.com/versity/versitygw/s3api/middlewares"
+	"github.com/versity/versitygw/s3api/utils"
 )
-
-func TestNew(t *testing.T) {
-	type args struct {
-		app  *fiber.App
-		be   backend.Backend
-		port string
-		root middlewares.RootUserConfig
-	}
-
-	app := fiber.New()
-	be := backend.BackendUnsupported{}
-	router := S3ApiRouter{}
-	port := ":7070"
-
-	tests := []struct {
-		name            string
-		args            args
-		wantS3ApiServer *S3ApiServer
-		wantErr         bool
-	}{
-		{
-			name: "Create S3 api server",
-			args: args{
-				app:  app,
-				be:   be,
-				port: port,
-				root: middlewares.RootUserConfig{},
-			},
-			wantS3ApiServer: &S3ApiServer{
-				app:     app,
-				port:    port,
-				router:  &router,
-				backend: be,
-			},
-			wantErr: false,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			gotS3ApiServer, err := New(tt.args.app, tt.args.be, tt.args.root,
-				tt.args.port, "us-east-1", &auth.IAMServiceInternal{}, nil, nil, nil, nil)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("New() error = %v, wantErr %v", err, tt.wantErr)
-				return
-			}
-			if !reflect.DeepEqual(gotS3ApiServer, tt.wantS3ApiServer) {
-				t.Errorf("New() = %v, want %v", gotS3ApiServer, tt.wantS3ApiServer)
-			}
-		})
-	}
-}
 
 func TestS3ApiServer_Serve(t *testing.T) {
 	tests := []struct {
 		name    string
 		sa      *S3ApiServer
 		wantErr bool
+		port    string
 	}{
 		{
-			name:    "Serve-invalid-address",
+			name:    "Serve-invalid-tcp-address",
 			wantErr: true,
 			sa: &S3ApiServer{
 				app:     fiber.New(),
 				backend: backend.BackendUnsupported{},
-				port:    "Invalid address",
-				router:  &S3ApiRouter{},
+				Router:  &S3ApiRouter{},
 			},
+			port: "localhost:notaport",
 		},
 		{
-			name:    "Serve-invalid-address-with-certificate",
+			name:    "Serve-invalid-tcp-address-with-certificate",
 			wantErr: true,
 			sa: &S3ApiServer{
-				app:     fiber.New(),
-				backend: backend.BackendUnsupported{},
-				port:    "Invalid address",
-				router:  &S3ApiRouter{},
-				cert:    &tls.Certificate{},
+				app:         fiber.New(),
+				backend:     backend.BackendUnsupported{},
+				Router:      &S3ApiRouter{},
+				CertStorage: &utils.CertStorage{},
 			},
+			port: "localhost:notaport",
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if err := tt.sa.Serve(); (err != nil) != tt.wantErr {
+			if err := tt.sa.ServeMultiPort([]string{tt.port}); (err != nil) != tt.wantErr {
 				t.Errorf("S3ApiServer.Serve() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})

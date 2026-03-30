@@ -76,12 +76,10 @@ calculate_composite_checksum() {
   fi
   log 5 "checksums: ${*:2}"
   for checksum in ${@:2}; do
-    if ! binary_checksum=$(echo -n "$checksum" | base64 -d 2>&1); then
-      log 2 "error calculating binary checksum: $binary_checksum"
+    if ! printf '%s' "$checksum" | base64 -d >> "$TEST_FILE_FOLDER/all_checksums.bin"; then
+      log 2 "error calculating binary checksum and adding to file"
       return 1
     fi
-    log 5 "binary checksum: $binary_checksum"
-    printf "%s" "$binary_checksum" | cat >> "$TEST_FILE_FOLDER/all_checksums.bin"
   done
   if [ "$1" == "sha256" ]; then
     composite=$(openssl dgst -sha256 -binary "$TEST_FILE_FOLDER/all_checksums.bin" | base64)
@@ -96,6 +94,7 @@ calculate_composite_checksum() {
     fi
   fi
   log 5 "composite: $composite"
+  echo "$composite"
 }
 
 test_multipart_upload_with_checksum() {
@@ -110,7 +109,7 @@ test_multipart_upload_with_checksum() {
     log 2 "error calculating multipart checksum"
     return 1
   fi
-  if ! complete_multipart_upload_with_checksum "$1" "$2" "$TEST_FILE_FOLDER/$2" "$upload_id" 2 "$3" "$4"; then
+  if ! complete_multipart_upload_with_checksum "$bucket_name" "$2" "$TEST_FILE_FOLDER/$2" "$upload_id" 2 "$3" "$4"; then
     log 2 "error completing multipart upload"
     return 1
   fi
@@ -125,7 +124,7 @@ test_complete_multipart_upload_unneeded_algorithm_parameter() {
     log 2 "error performing multipart upload with checksum before completion"
     return 1
   fi
-  if ! complete_multipart_upload_rest_nonexistent_param "$1" "$2" "$upload_id" "$parts_payload"; then
+  if ! complete_multipart_upload_rest_nonexistent_param "$bucket_name" "$2" "$upload_id" "$parts_payload"; then
     log 2 "error completing multipart upload with nonexistent param"
     return 1
   fi
@@ -144,7 +143,7 @@ test_complete_multipart_upload_incorrect_checksum() {
     log 2 "error calculating multipart checksum"
     return 1
   fi
-  if ! complete_multipart_upload_rest_incorrect_checksum "$1" "$2" "$upload_id" "$parts_payload" "$3" "$4" "$checksum"; then
+  if ! complete_multipart_upload_rest_incorrect_checksum "$bucket_name" "$2" "$upload_id" "$parts_payload" "$3" "$4" "$checksum"; then
     log 2 "error completing multipart upload with nonexistent param"
     return 1
   fi
@@ -159,7 +158,7 @@ test_complete_multipart_upload_invalid_checksum() {
     log 2 "error performing multipart upload with checksum before completion"
     return 1
   fi
-  if ! complete_multipart_upload_rest_invalid_checksum "$1" "$2" "$upload_id" "$parts_payload" "$3" "$4" "wrong"; then
+  if ! complete_multipart_upload_rest_invalid_checksum "$bucket_name" "$2" "$upload_id" "$parts_payload" "$3" "$4" "wrong"; then
     log 2 "error completing multipart upload with nonexistent param"
     return 1
   fi
@@ -175,6 +174,65 @@ complete_multipart_upload_invalid_object_size_string() {
     return 1
   fi
   if ! complete_multipart_upload_rest_expect_error "$1" "$2" "$upload_id" "$parts_payload" "MULTIPART_OBJECT_SIZE=size" "400" "InvalidRequest" "Value for x-amz-mp-object-size header is invalid"; then
+    log 2 "error completing multipart upload"
+    return 1
+  fi
+  return 0
+}
+
+perform_multipart_upload_rest() {
+  if  ! check_param_count_v2 "bucket, key, four parts" 6 $#; then
+    return 1
+  fi
+  if ! upload_id=$(create_multipart_upload_rest "$1" "$2" "" "parse_upload_id" 2>&1); then
+    log 2 "error creating multipart upload: $upload_id"
+    return 1
+  fi
+  if ! etag=$(upload_part_rest "$1" "$2" "$upload_id" 1 "$3" 2>&1); then
+    log 2 "error uploading part 1"
+    return 1
+  fi
+  parts_payload="<Part><ETag>$etag</ETag><PartNumber>1</PartNumber></Part>"
+  if ! etag=$(upload_part_rest "$1" "$2" "$upload_id" 2 "$4" 2>&1); then
+    log 2 "error uploading part 2: $etag"
+    return 1
+  fi
+  parts_payload+="<Part><ETag>$etag</ETag><PartNumber>2</PartNumber></Part>"
+  if ! etag=$(upload_part_rest "$1" "$2" "$upload_id" 3 "$5" 2>&1); then
+    log 2 "error uploading part 3: $etag"
+    return 1
+  fi
+  parts_payload+="<Part><ETag>$etag</ETag><PartNumber>3</PartNumber></Part>"
+  if ! etag=$(upload_part_rest "$1" "$2" "$upload_id" 4 "$6" 2>&1); then
+    log 2 "error uploading part 4: $etag"
+    return 1
+  fi
+  parts_payload+="<Part><ETag>$etag</ETag><PartNumber>4</PartNumber></Part>"
+  if ! complete_multipart_upload_rest "$1" "$2" "$upload_id" "$parts_payload"; then
+    log 2 "error completing multipart upload"
+    return 1
+  fi
+  return 0
+}
+
+upload_check_parts() {
+  if ! check_param_count_v2 "bucket, key, list of 4 parts" 6 $#; then
+    return 1
+  fi
+  if ! upload_id=$(create_multipart_upload_rest "$1" "$2" "" "parse_upload_id" 2>&1); then
+    log 2 "error creating upload: $upload_id"
+    return 1
+  fi
+  if ! check_part_list_rest "$1" "$2" "$upload_id" 0; then
+    log 2 "error checking part list before part upload"
+    return 1
+  fi
+  if ! parts_payload=$(upload_each_part_and_check "$1" "$2" "$upload_id" "${@:3}" 2>&1); then
+    log 2 "error uploading and checking parts: $parts_payload"
+    return 1
+  fi
+  log 5 "PARTS PAYLOAD:  $parts_payload"
+  if ! complete_multipart_upload_rest "$1" "$2" "$upload_id" "$parts_payload"; then
     log 2 "error completing multipart upload"
     return 1
   fi

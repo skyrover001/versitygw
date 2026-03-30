@@ -15,6 +15,33 @@
 # under the License.
 
 source ./tests/drivers/xml.sh
+source ./tests/report.sh
+
+write_openssl_command_to_command_log() {
+  if ! check_param_count_v2 "command file" 1 $#; then
+    return 1
+  fi
+  max_chars=1024
+  if [ -n "$MAX_OPENSSL_COMMAND_LOG_BYTES" ]; then
+    max_chars="$MAX_OPENSSL_COMMAND_LOG_BYTES"
+  fi
+  if ! file_size=$(get_file_size "$1"); then
+    return 1
+  fi
+  if [ "$max_chars" -eq -1 ] || [ "$file_size" -lt "$max_chars" ]; then
+    log_data=$(perl -pe 's/\x00/<NULL>/g' "$1" | perl -pe 's/\r/<CR>/g')
+  else
+    log_data=$(head -c "$max_chars" "$1" | perl -pe 's/\x00/<NULL>/g' | perl -pe 's/\r/<CR>/g')
+    log_data+="<TRUNC>"
+  fi
+  while IFS=$' ' read -r -a line_words; do
+    if ! mask_arg_array "${line_words[@]}"; then
+      return 1
+    fi
+    # shellcheck disable=SC2154
+    echo "${masked_args[*]}" >> "$COMMAND_LOG"
+  done <<< "$log_data"
+}
 
 send_via_openssl() {
   if ! check_param_count_v2 "command file" 1 $#; then
@@ -25,6 +52,12 @@ send_via_openssl() {
     host+=":443"
   fi
   log 5 "connecting to $host"
+  if [ -n "$COMMAND_LOG" ]; then
+    write_openssl_command_to_command_log "$1"
+  fi
+  if ! record_openssl_command "$1"; then
+    log 3 "error recording openssl command"
+  fi
   if ! result=$(openssl s_client -connect "$host" -ign_eof < "$1" 2>&1); then
     log 2 "error sending openssl command: $result"
     return 1
@@ -46,6 +79,27 @@ send_via_openssl_and_check_code() {
     return 1
   fi
   echo "$result"
+}
+
+send_via_openssl_and_check_code_header() {
+  if ! check_param_count_v2 "command file, expected code, header key, expected value" 4 $#; then
+    return 1
+  fi
+  if ! send_via_openssl_and_check_code "$1" "$2"; then
+    log 2 "error sending via openssl and checking code"
+    return 1
+  fi
+  header_line="$(echo "$result" | grep "$3")"
+  if [ "$header_line" == "" ]; then
+    log 2 "header key '$3' not found in header data"
+    return 1
+  fi
+  header_value="$(echo "$header_line" | awk '{print $2}' | tr -d '\r')"
+  if [ "$header_value" != "$4" ]; then
+    log 2 "expected header value of '$4', was '$header_value'"
+    return 1
+  fi
+  return 0
 }
 
 send_via_openssl_check_code_error_contains() {
@@ -88,6 +142,53 @@ send_via_openssl_with_timeout() {
   fi
   if ! [[ "$result" =~ .*$'\nclosed' ]]; then
     log 2 "connection not closed properly: $result"
+    return 1
+  fi
+  return 0
+}
+
+send_openssl_go_command_expect_error() {
+  if ! check_param_count_gt "expected HTTP code, expected error code, expected message, params" 4 $#; then
+    return 1
+  fi
+  if ! result=$(go run "./tests/rest_scripts/generateCommand.go" "-awsAccessKeyId" "$AWS_ACCESS_KEY_ID" "-awsSecretAccessKey" \
+      "$AWS_SECRET_ACCESS_KEY" "-url" "$AWS_ENDPOINT_URL" "-awsRegion" "$AWS_REGION" "-client" "openssl" "-filePath" "$TEST_FILE_FOLDER/openssl_command.txt" "${@:4}" 2>&1); then
+    log 2 "error sending go command and checking error: $result"
+    return 1
+  fi
+  if ! send_via_openssl_check_code_error_contains "$TEST_FILE_FOLDER/openssl_command.txt" "$1" "$2" "$3"; then
+    log 2 "error sending via openssl"
+    return 1
+  fi
+  return 0
+}
+
+send_openssl_go_command() {
+  if ! check_param_count_gt "expected HTTP code, params" 2 $#; then
+    return 1
+  fi
+  if ! result=$(go run "./tests/rest_scripts/generateCommand.go" "-awsAccessKeyId" "$AWS_ACCESS_KEY_ID" "-awsSecretAccessKey" "$AWS_SECRET_ACCESS_KEY" "-awsRegion" "$AWS_REGION" "-url" "$AWS_ENDPOINT_URL" "-client" "openssl" "-filePath" "$TEST_FILE_FOLDER/openssl_command.txt" "${@:2}" 2>&1); then
+    log 2 "error sending go command and checking error: $result"
+    return 1
+  fi
+  if ! result=$(send_via_openssl_and_check_code "$TEST_FILE_FOLDER/openssl_command.txt" "$1" 2>&1); then
+    log 2 "error sending via openssl and checking code: $result"
+    return 1
+  fi
+  return 0
+}
+
+send_openssl_go_command_check_header() {
+  if ! check_param_count_gt "expected HTTP code, header key, value, params" 4 $#; then
+    return 1
+  fi
+  if ! result=$(go run "./tests/rest_scripts/generateCommand.go" "-awsAccessKeyId" "$AWS_ACCESS_KEY_ID" "-awsSecretAccessKey" "$AWS_SECRET_ACCESS_KEY" \
+      "-awsRegion" "$AWS_REGION" "-url" "$AWS_ENDPOINT_URL" "-client" "openssl" "-filePath" "$TEST_FILE_FOLDER/openssl_command.txt" "${@:4}" 2>&1); then
+    log 2 "error sending go command and checking error: $result"
+    return 1
+  fi
+  if ! send_via_openssl_and_check_code_header "$TEST_FILE_FOLDER/openssl_command.txt" "$1" "$2" "$3"; then
+    log 2 "error sending command, checking code and header value"
     return 1
   fi
   return 0

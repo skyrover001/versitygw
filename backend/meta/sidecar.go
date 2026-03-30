@@ -17,6 +17,7 @@ package meta
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 )
@@ -74,11 +75,22 @@ func (s SideCar) StoreAttribute(_ *os.File, bucket, object, attribute string, va
 	}
 
 	attr := filepath.Join(metadir, attribute)
-	err = os.WriteFile(attr, value, 0666)
+	tempfile, err := os.CreateTemp(metadir, attribute)
+	if err != nil {
+		return fmt.Errorf("failed to create temporary file: %v", err)
+	}
+	defer os.Remove(tempfile.Name())
+	defer tempfile.Close()
+
+	_, err = tempfile.Write(value)
 	if err != nil {
 		return fmt.Errorf("failed to write attribute: %v", err)
 	}
 
+	err = os.Rename(tempfile.Name(), attr)
+	if err != nil {
+		return fmt.Errorf("failed to rename temporary file: %v", err)
+	}
 	return nil
 }
 
@@ -97,6 +109,8 @@ func (s SideCar) DeleteAttribute(bucket, object, attribute string) error {
 	if err != nil {
 		return fmt.Errorf("failed to remove attribute: %v", err)
 	}
+
+	s.cleanupEmptyDirs(metadir, bucket, object)
 
 	return nil
 }
@@ -135,5 +149,60 @@ func (s SideCar) DeleteAttributes(bucket, object string) error {
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("failed to remove attributes: %v", err)
 	}
+	s.cleanupEmptyDirs(metadir, bucket, object)
 	return nil
+}
+
+func (s SideCar) cleanupEmptyDirs(metadir, bucket, object string) {
+	removeIfEmpty(metadir)
+	if bucket == "" {
+		return
+	}
+	bucketDir := filepath.Join(s.dir, bucket)
+	if object != "" {
+		removeEmptyParents(filepath.Dir(metadir), bucketDir)
+	}
+	removeIfEmpty(bucketDir)
+}
+
+func removeIfEmpty(dir string) {
+	empty, err := isDirEmpty(dir)
+	if err != nil || !empty {
+		return
+	}
+	_ = os.Remove(dir)
+}
+
+func removeEmptyParents(dir, stopDir string) {
+	for {
+		if dir == stopDir || dir == "." || dir == string(filepath.Separator) {
+			return
+		}
+		empty, err := isDirEmpty(dir)
+		if err != nil || !empty {
+			return
+		}
+		err = os.Remove(dir)
+		if err != nil {
+			return
+		}
+		dir = filepath.Dir(dir)
+	}
+}
+
+func isDirEmpty(dir string) (bool, error) {
+	f, err := os.Open(dir)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+
+	ents, err := f.Readdirnames(1)
+	if err == io.EOF {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return len(ents) == 0, nil
 }

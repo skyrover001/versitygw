@@ -14,8 +14,6 @@
 # specific language governing permissions and limitations
 # under the License.
 
-source ./tests/util/util_bucket.sh
-source ./tests/util/util_create_bucket.sh
 source ./tests/util/util_mc.sh
 source ./tests/util/util_multipart.sh
 source ./tests/util/util_versioning.sh
@@ -194,10 +192,10 @@ copy_file() {
 
 list_and_check_directory_obj() {
   log 6 "list_and_check_directory_obj"
-  if ! check_param_count "list_and_check_directory_obj" "client, file name" 2 $#; then
+  if ! check_param_count "list_and_check_directory_obj" "client, bucket, file name" 3 $#; then
     return 1
   fi
-  if ! list_objects_with_prefix "$1" "$BUCKET_ONE_NAME" "$2/"; then
+  if ! list_objects_with_prefix "$1" "$2" "$3/"; then
     log 2 "error listing objects with prefix"
     return 1
   fi
@@ -207,15 +205,15 @@ list_and_check_directory_obj() {
       log 2 "error getting key: $key"
       return 1
     fi
-    if [ "$key" != "$2/" ]; then
-      log 2 "key mismatch ($key, $2)"
+    if [ "$key" != "$3/" ]; then
+      log 2 "key mismatch ($key, $3)"
       return 1
     fi
   elif [ "$1" == "s3" ]; then
     log 5 "$objects"
     filename=$(echo "$objects" | grep -v "InsecureRequestWarning" | awk '{print $4}')
-    if [ "$filename" != "$2" ]; then
-      log 2 "filename mismatch ($filename, $2)"
+    if [ "$filename" != "$3" ]; then
+      log 2 "filename mismatch ($filename, $3)"
       return 1
     fi
   fi
@@ -264,12 +262,18 @@ check_checksum_rest_invalid() {
   if ! check_param_count "check_checksum_rest_invalid" "checksum type" 1 $#; then
     return 1
   fi
+
+  if ! bucket_name=$(get_bucket_name "$BUCKET_ONE_NAME" 2>&1); then
+    log 2 "error getting bucket name: $bucket_name"
+    return 1
+  fi
+
   test_file="test_file"
-  if ! setup_bucket_and_file "$BUCKET_ONE_NAME" "$test_file"; then
+  if ! setup_bucket_and_file_v2 "$bucket_name" "$test_file"; then
     log 2 "error setting up bucket and file"
     return 1
   fi
-  if ! check_checksum_invalid_or_incorrect "$TEST_FILE_FOLDER/$test_file" "$BUCKET_ONE_NAME" "$test_file" "$1" "dummy" "Value for x-amz-checksum-$1 header is invalid."; then
+  if ! check_checksum_invalid_or_incorrect "$TEST_FILE_FOLDER/$test_file" "$bucket_name" "$test_file" "$1" "dummy" "Value for x-amz-checksum-$1 header is invalid."; then
     log 2 "error checking checksum"
     return 1
   fi
@@ -280,8 +284,14 @@ check_checksum_rest_incorrect() {
   if ! check_param_count "check_checksum_rest_incorrect" "checksum type" 1 $#; then
     return 1
   fi
+
+  if ! bucket_name=$(get_bucket_name "$BUCKET_ONE_NAME" 2>&1); then
+    log 2 "error getting bucket name: $bucket_name"
+    return 1
+  fi
+
   test_file="test_file"
-  if ! setup_bucket_and_file "$BUCKET_ONE_NAME" "$test_file"; then
+  if ! setup_bucket_and_file "$bucket_name" "$test_file"; then
     log 2 "error setting up bucket and file"
     return 1
   fi
@@ -291,7 +301,7 @@ check_checksum_rest_incorrect() {
     log 2 "error calculating incorrect checksum"
     return 1
   fi
-  if ! check_checksum_invalid_or_incorrect "$TEST_FILE_FOLDER/$test_file" "$BUCKET_ONE_NAME" "$test_file" "$1" "$incorrect_checksum" "$error_message"; then
+  if ! check_checksum_invalid_or_incorrect "$TEST_FILE_FOLDER/$test_file" "$bucket_name" "$test_file" "$1" "$incorrect_checksum" "$error_message"; then
     log 2 "error checking checksum"
     return 1
   fi
@@ -302,6 +312,7 @@ calculate_incorrect_checksum() {
   if ! check_param_count "calculate_incorrect_checksum" "checksum type, data file" 2 $#; then
     return 1
   fi
+
   if ! checksum=$(DATA_FILE="$2" CHECKSUM_TYPE="$1" TEST_FILE_FOLDER="$TEST_FILE_FOLDER" ./tests/rest_scripts/calculate_checksum.sh 2>&1); then
     log 2 "error calculating checksum: $checksum"
     return 1
@@ -334,13 +345,18 @@ add_correct_checksum() {
   if ! check_param_count "add_correct_checksum" "checksum type" 1 $#; then
     return 1
   fi
+  if ! bucket_name=$(get_bucket_name "$BUCKET_ONE_NAME" 2>&1); then
+    log 2 "error getting bucket name: $bucket_name"
+    return 1
+  fi
+
   test_file="test_file"
-  if ! setup_bucket_and_file "$BUCKET_ONE_NAME" "$test_file"; then
+  if ! setup_bucket_and_file "$bucket_name" "$test_file"; then
     log 2 "error setting up bucket and file"
     return 1
   fi
 
-  if ! put_object_rest_checksum "$TEST_FILE_FOLDER/$test_file" "$BUCKET_ONE_NAME" "$test_file" "$1"; then
+  if ! put_object_rest_checksum "$TEST_FILE_FOLDER/$test_file" "$bucket_name" "$test_file" "$1"; then
     log 2 "error adding file with checksum to s3"
     return 1
   fi
@@ -371,7 +387,7 @@ put_object_rest_check_expires_header() {
     log 2 "expected response code of '200', was '$result' ($(cat "$TEST_FILE_FOLDER/result.txt"))"
     return 1
   fi
-  if ! result=$(COMMAND_LOG="$COMMAND_LOG" BUCKET_NAME="$BUCKET_ONE_NAME" OBJECT_KEY="$test_file" OUTPUT_FILE="$TEST_FILE_FOLDER/result.txt" ./tests/rest_scripts/head_object.sh 2>&1); then
+  if ! result=$(COMMAND_LOG="$COMMAND_LOG" BUCKET_NAME="$2" OBJECT_KEY="$3" OUTPUT_FILE="$TEST_FILE_FOLDER/result.txt" ./tests/rest_scripts/head_object.sh 2>&1); then
     log 2 "error: $result"
     return 1
   fi

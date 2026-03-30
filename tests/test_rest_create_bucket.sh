@@ -28,28 +28,30 @@ export RUN_USERS=true
   if [ "$RECREATE_BUCKETS" == "false" ]; then
     skip "skip bucket create tests for static buckets"
   fi
-  run bucket_cleanup_if_bucket_exists "$BUCKET_ONE_NAME"
+  run get_bucket_name "$BUCKET_ONE_NAME"
+  assert_success
+  bucket_name="$output"
+
+  run setup_bucket_v2 "$bucket_name"
   assert_success
 
-  run create_bucket_rest "$BUCKET_ONE_NAME"
-  assert_success
-
-  run list_check_buckets_rest "$BUCKET_ONE_NAME"
+  run list_check_buckets_rest "$bucket_name"
   assert_success
 }
 
 @test "REST - CreateBucket w/invalid acl" {
-  if [ "$DIRECT" != "true" ]; then
-    skip "https://github.com/versity/versitygw/issues/1379"
-  fi
   if [ "$RECREATE_BUCKETS" == "false" ]; then
     skip "skip bucket create tests for static buckets"
   fi
-  run bucket_cleanup_if_bucket_exists "$BUCKET_ONE_NAME"
+  run get_bucket_name "$BUCKET_ONE_NAME"
+  assert_success
+  bucket_name="$output"
+
+  run bucket_cleanup_if_bucket_exists_v2 "$BUCKET_ONE_NAME"
   assert_success
 
   envs="ACL=public-reads OBJECT_OWNERSHIP=BucketOwnerPreferred"
-  run create_bucket_rest_expect_error "$BUCKET_ONE_NAME" "$envs" "400" "InvalidArgument" ""
+  run create_bucket_rest_expect_error "$bucket_name" "$envs" "400" "InvalidArgument" ""
   assert_success
 }
 
@@ -77,7 +79,7 @@ export RUN_USERS=true
   if [ "$RECREATE_BUCKETS" == "false" ]; then
     skip "skip bucket create tests for static buckets"
   fi
-  run bucket_cleanup_if_bucket_exists "$BUCKET_ONE_NAME"
+  run bucket_cleanup_if_bucket_exists_v2 "$BUCKET_ONE_NAME"
   assert_success
 
   if [ "$DIRECT" == "true" ]; then
@@ -86,7 +88,12 @@ export RUN_USERS=true
     id="$AWS_ACCESS_KEY_ID"
   fi
   envs="GRANT_FULL_CONTROL=$id"
-  run create_bucket_rest_expect_error "$BUCKET_ONE_NAME" "$envs" "400" "InvalidBucketAclWithObjectOwnership" "Bucket cannot have ACLs set"
+
+  run get_bucket_name "$BUCKET_ONE_NAME"
+  assert_success
+  bucket_name="$output"
+
+  run create_bucket_rest_expect_error "$bucket_name" "$envs" "400" "InvalidBucketAclWithObjectOwnership" "Bucket cannot have ACLs set"
   assert_success
 }
 
@@ -112,5 +119,39 @@ export RUN_USERS=true
 
 @test "REST - CreateBucket - x-amz-grant-write-acp" {
   run setup_and_create_bucket_and_check_acl "GRANT_WRITE_ACP"
+  assert_success
+}
+
+@test "REST - CreateBucket - empty location constraint" {
+  run send_curl_command_create_bucket_expect_error "400" "InvalidLocationConstraint" "The specified location-constraint is not valid" "-locationConstraint" ""
+  assert_success
+}
+
+@test "REST - CreateBucket - location constraint mismatch" {
+  if [ "$DIRECT" == "true" ]; then
+    skip "not valid for direct mode"
+  fi
+  local region="us-east-1"
+  if [ "$AWS_REGION" == "us-east-1" ]; then
+    region="us-west-1"
+  fi
+
+  run send_curl_command_create_bucket_expect_error "400" "InvalidLocationConstraint" "The specified location-constraint is not valid" "-locationConstraint" "$region"
+  assert_success
+}
+
+@test "REST - CreateBucket - fail - us-east-1 with 'us-east-1' location constraint" {
+  if [ "$AWS_REGION" != "us-east-1" ]; then
+    skip "only valid for us-east-1 region"
+  fi
+  run send_curl_command_create_bucket_expect_error "400" "InvalidLocationConstraint" "The specified location-constraint is not valid" "-locationConstraint" "us-east-1"
+  assert_success
+}
+
+@test "REST - CreateBucket - location constraint error returns invalid constraint" {
+  if [ "$DIRECT" != "true" ]; then
+    skip "https://github.com/versity/versitygw/issues/1645"
+  fi
+  run send_invalid_location_constraint_check_error "abc"
   assert_success
 }

@@ -30,10 +30,16 @@ import (
 func (c S3ApiController) DeleteObjectTagging(ctx *fiber.Ctx) (*Response, error) {
 	bucket := ctx.Params("bucket")
 	key := strings.TrimPrefix(ctx.Path(), fmt.Sprintf("/%s/", bucket))
+	versionId := ctx.Query("versionId")
 	acct := utils.ContextKeyAccount.Get(ctx).(auth.Account)
 	isRoot := utils.ContextKeyIsRoot.Get(ctx).(bool)
 	isBucketPublic := utils.ContextKeyPublicBucket.IsSet(ctx)
 	parsedAcl := utils.ContextKeyParsedAcl.Get(ctx).(auth.ACL)
+
+	action := auth.DeleteObjectTaggingAction
+	if versionId != "" {
+		action = auth.DeleteObjectVersionTaggingAction
+	}
 
 	err := auth.VerifyAccess(ctx.Context(), c.be,
 		auth.AccessOptions{
@@ -44,8 +50,9 @@ func (c S3ApiController) DeleteObjectTagging(ctx *fiber.Ctx) (*Response, error) 
 			Acc:             acct,
 			Bucket:          bucket,
 			Object:          key,
-			Action:          auth.DeleteObjectTaggingAction,
+			Action:          action,
 			IsPublicRequest: isBucketPublic,
+			DisableACL:      c.disableACL,
 		})
 	if err != nil {
 		return &Response{
@@ -55,8 +62,20 @@ func (c S3ApiController) DeleteObjectTagging(ctx *fiber.Ctx) (*Response, error) 
 		}, err
 	}
 
-	err = c.be.DeleteObjectTagging(ctx.Context(), bucket, key)
+	err = utils.ValidateVersionId(versionId)
+	if err != nil {
+		return &Response{
+			MetaOpts: &MetaOptions{
+				BucketOwner: parsedAcl.Owner,
+			},
+		}, err
+	}
+
+	err = c.be.DeleteObjectTagging(ctx.Context(), bucket, key, versionId)
 	return &Response{
+		Headers: map[string]*string{
+			"x-amz-version-id": &versionId,
+		},
 		MetaOpts: &MetaOptions{
 			Status:      http.StatusNoContent,
 			BucketOwner: parsedAcl.Owner,
@@ -86,6 +105,7 @@ func (c S3ApiController) AbortMultipartUpload(ctx *fiber.Ctx) (*Response, error)
 			Object:          key,
 			Action:          auth.AbortMultipartUploadAction,
 			IsPublicRequest: isBucketPublic,
+			DisableACL:      c.disableACL,
 		})
 	if err != nil {
 		return &Response{
@@ -115,7 +135,7 @@ func (c S3ApiController) DeleteObject(ctx *fiber.Ctx) (*Response, error) {
 	key := strings.TrimPrefix(ctx.Path(), fmt.Sprintf("/%s/", bucket))
 	versionId := ctx.Query("versionId")
 	bypass := strings.EqualFold(ctx.Get("X-Amz-Bypass-Governance-Retention"), "true")
-	ifMatch := utils.GetStringPtr(ctx.Get("If-Match"))
+	ifMatch := utils.GetStringPtr(utils.TrimQuotes(ctx.Get("If-Match")))
 	ifMatchLastModTime := utils.ParsePreconditionDateHeader(ctx.Get("X-Amz-If-Match-Last-Modified-Time"))
 	ifMatchSize := utils.ParseIfMatchSize(ctx)
 	// context locals
@@ -124,7 +144,10 @@ func (c S3ApiController) DeleteObject(ctx *fiber.Ctx) (*Response, error) {
 	isBucketPublic := utils.ContextKeyPublicBucket.IsSet(ctx)
 	parsedAcl := utils.ContextKeyParsedAcl.Get(ctx).(auth.ACL)
 
-	//TODO: check s3:DeleteObjectVersion policy in case a use tries to delete a version of an object
+	action := auth.DeleteObjectAction
+	if versionId != "" {
+		action = auth.DeleteObjectVersionAction
+	}
 
 	err := auth.VerifyAccess(ctx.Context(), c.be,
 		auth.AccessOptions{
@@ -135,9 +158,19 @@ func (c S3ApiController) DeleteObject(ctx *fiber.Ctx) (*Response, error) {
 			Acc:             acct,
 			Bucket:          bucket,
 			Object:          key,
-			Action:          auth.DeleteObjectAction,
+			Action:          action,
 			IsPublicRequest: isBucketPublic,
+			DisableACL:      c.disableACL,
 		})
+	if err != nil {
+		return &Response{
+			MetaOpts: &MetaOptions{
+				BucketOwner: parsedAcl.Owner,
+			},
+		}, err
+	}
+
+	err = utils.ValidateVersionId(versionId)
 	if err != nil {
 		return &Response{
 			MetaOpts: &MetaOptions{
@@ -159,6 +192,7 @@ func (c S3ApiController) DeleteObject(ctx *fiber.Ctx) (*Response, error) {
 		bypass,
 		isBucketPublic,
 		c.be,
+		false,
 	)
 	if err != nil {
 		return &Response{

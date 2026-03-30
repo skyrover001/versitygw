@@ -17,6 +17,7 @@
 load ./bats-support/load
 load ./bats-assert/load
 
+source ./tests/drivers/create_bucket/create_bucket_rest.sh
 source ./tests/drivers/get_bucket_ownership_controls/get_bucket_ownership_controls_rest.sh
 source ./tests/drivers/user.sh
 source ./tests/setup.sh
@@ -25,50 +26,63 @@ export RUN_USERS=true
 
 @test "REST - DeleteBucketOwnershipControls - lack permission" {
   if [ "$SKIP_USERS_TESTS" == "true" ]; then
-    skip
+    skip "skip versitygw-specific users tests"
   fi
-  run setup_bucket_and_user_v2 "$BUCKET_ONE_NAME" "$USERNAME_ONE" "$PASSWORD_ONE"
+  run get_bucket_name "$BUCKET_ONE_NAME"
   assert_success
-  username=${lines[2]}
-  password=${lines[3]}
+  bucket_name="$output"
+
+  run setup_bucket_and_acl_user "$bucket_name" "$USERNAME_ONE" "$PASSWORD_ONE"
+  assert_success
+  username=${lines[${#lines[@]}-2]}
+  password=${lines[${#lines[@]}-1]}
+  log 5 "output: $output"
   log 5 "username: $username, password: $password"
 
   run send_rest_go_command_expect_error "403" "AccessDenied" "Access Denied" "-awsAccessKeyId" "$username" "-awsSecretAccessKey" "$password" \
-    "-method" "DELETE" "-bucketName" "$BUCKET_ONE_NAME" "-query" "ownershipControls="
+    "-method" "DELETE" "-bucketName" "$bucket_name" "-query" "ownershipControls="
   assert_success
 }
 
 @test "REST - DeleteBucketOwnershipControls - invalid username" {
   if [ "$SKIP_USERS_TESTS" == "true" ]; then
-    skip
+    skip "skip versitygw-specific users tests"
   fi
-  run setup_bucket "$BUCKET_ONE_NAME"
+  run get_bucket_name "$BUCKET_ONE_NAME"
+  assert_success
+  bucket_name="$output"
+
+  run setup_bucket_v2 "$bucket_name"
   assert_success
 
   username="invalid with spaces"
   password="dummy"
 
   run send_rest_go_command_expect_error "403" "InvalidAccessKeyId" "does not exist in our records" "-awsAccessKeyId" "$username" "-awsSecretAccessKey" "$password" \
-    "-method" "DELETE" "-bucketName" "$BUCKET_ONE_NAME" "-query" "ownershipControls="
+    "-method" "DELETE" "-bucketName" "$bucket_name" "-query" "ownershipControls="
   assert_success
 }
 
 @test "REST - DeleteBucketOwnershipControls - success" {
-  run setup_bucket "$BUCKET_ONE_NAME"
+  run get_bucket_name "$BUCKET_ONE_NAME"
+  assert_success
+  bucket_name="$output"
+
+  run setup_bucket_v2 "$bucket_name"
   assert_success
 
-  run put_bucket_ownership_controls_rest "$BUCKET_ONE_NAME" "BucketOwnerPreferred"
+  run put_bucket_ownership_controls_rest "$bucket_name" "BucketOwnerPreferred"
   assert_success
 
-  run get_bucket_ownership_controls_rest "$BUCKET_ONE_NAME"
+  run get_bucket_ownership_controls_rest "$bucket_name"
   assert_success
   rule=${output[${#output[@]}-1]}
   assert_equal "$rule" "BucketOwnerPreferred"
 
-  run send_rest_go_command "204" "-method" "DELETE" "-bucketName" "$BUCKET_ONE_NAME" "-query" "ownershipControls="
+  run send_rest_go_command "204" "-method" "DELETE" "-bucketName" "$bucket_name" "-query" "ownershipControls="
   assert_success
 
-  run get_bucket_ownership_controls_rest "$BUCKET_ONE_NAME"
+  run get_bucket_ownership_controls_rest "$bucket_name"
   assert_success
   rule=${output[${#output[@]}-1]}
   assert_equal "$rule" ""
@@ -78,15 +92,19 @@ export RUN_USERS=true
   if [ "$DIRECT" != "true" ]; then
     skip "https://github.com/versity/versitygw/issues/1493"
   fi
-  run setup_bucket "$BUCKET_ONE_NAME"
+  run get_bucket_name "$BUCKET_ONE_NAME"
+  assert_success
+  bucket_name="$output"
+
+  run setup_bucket "$bucket_name"
   assert_success
 
   if ! send_rest_go_command "204" \
-    "-method" "DELETE" "-bucketName" "$BUCKET_ONE_NAME" "-query" "ownershipControls="; then
+    "-method" "DELETE" "-bucketName" "$bucket_name" "-query" "ownershipControls="; then
     log 2 "error deleting ownership controls"
     return 1
   fi
 
-  run get_bucket_ownership_controls_check_error_after_deletion "$BUCKET_ONE_NAME"
+  run get_bucket_ownership_controls_check_error_after_deletion "$bucket_name"
   assert_success
 }

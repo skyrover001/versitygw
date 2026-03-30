@@ -319,7 +319,7 @@ func TestS3ApiController_GetBucketCors(t *testing.T) {
 	cors := &auth.CORSConfiguration{
 		Rules: []auth.CORSRule{
 			{
-				AllowedOrigins: []string{"origin"},
+				AllowedOrigins: []auth.CORSOrigin{"origin"},
 				AllowedMethods: []auth.CORSHTTPMethod{http.MethodPut},
 				AllowedHeaders: []auth.CORSHeader{"X-Amz-Date"},
 			},
@@ -654,7 +654,7 @@ func TestS3ApiController_ListObjectVersions(t *testing.T) {
 			input: testInput{
 				locals: defaultLocals,
 				queries: map[string]string{
-					"max-keys": "-1",
+					"max-keys": "invalid",
 				},
 			},
 			output: testOutput{
@@ -663,7 +663,7 @@ func TestS3ApiController_ListObjectVersions(t *testing.T) {
 						BucketOwner: "root",
 					},
 				},
-				err: s3err.GetAPIError(s3err.ErrInvalidMaxKeys),
+				err: s3err.GetInvalidMaxLimiterErr(utils.LimiterTypeMaxKeys),
 			},
 		},
 		{
@@ -979,7 +979,7 @@ func TestS3ApiController_ListMultipartUploads(t *testing.T) {
 			input: testInput{
 				locals: defaultLocals,
 				queries: map[string]string{
-					"max-uploads": "-1",
+					"max-uploads": "invalid",
 				},
 			},
 			output: testOutput{
@@ -988,7 +988,7 @@ func TestS3ApiController_ListMultipartUploads(t *testing.T) {
 						BucketOwner: "root",
 					},
 				},
-				err: s3err.GetAPIError(s3err.ErrInvalidMaxUploads),
+				err: s3err.GetInvalidMaxLimiterErr(utils.LimiterTypeMaxUploads),
 			},
 		},
 		{
@@ -1082,7 +1082,7 @@ func TestS3ApiController_ListObjectsV2(t *testing.T) {
 			},
 		},
 		{
-			name: "invalid max keys",
+			name: "negative max keys",
 			input: testInput{
 				locals: defaultLocals,
 				queries: map[string]string{
@@ -1095,7 +1095,7 @@ func TestS3ApiController_ListObjectsV2(t *testing.T) {
 						BucketOwner: "root",
 					},
 				},
-				err: s3err.GetAPIError(s3err.ErrInvalidMaxKeys),
+				err: s3err.GetNegativeMaxLimiterErr(utils.LimiterTypeMaxKeys),
 			},
 		},
 		{
@@ -1193,7 +1193,7 @@ func TestS3ApiController_ListObjects(t *testing.T) {
 			input: testInput{
 				locals: defaultLocals,
 				queries: map[string]string{
-					"max-keys": "-1",
+					"max-keys": "bla",
 				},
 			},
 			output: testOutput{
@@ -1202,7 +1202,7 @@ func TestS3ApiController_ListObjects(t *testing.T) {
 						BucketOwner: "root",
 					},
 				},
-				err: s3err.GetAPIError(s3err.ErrInvalidMaxKeys),
+				err: s3err.GetInvalidMaxLimiterErr(utils.LimiterTypeMaxKeys),
 			},
 		},
 		{
@@ -1303,14 +1303,40 @@ func TestS3ApiController_GetBucketLocation(t *testing.T) {
 			},
 		},
 		{
-			name: "successful response",
+			name: "successful response us-east-1",
 			input: testInput{
 				locals: defaultLocals,
 			},
 			output: testOutput{
 				response: &Response{
 					Data: s3response.LocationConstraint{
-						Value: "us-east-1",
+						Value: nil,
+					},
+					MetaOpts: &MetaOptions{
+						BucketOwner: "root",
+					},
+				},
+			},
+		},
+		{
+			name: "successful response",
+			input: testInput{
+				locals: map[utils.ContextKey]any{
+					utils.ContextKeyIsRoot: true,
+					utils.ContextKeyParsedAcl: auth.ACL{
+						Owner: "root",
+					},
+					utils.ContextKeyAccount: auth.Account{
+						Access: "root",
+						Role:   auth.RoleAdmin,
+					},
+					utils.ContextKeyRegion: "us-east-2",
+				},
+			},
+			output: testOutput{
+				response: &Response{
+					Data: s3response.LocationConstraint{
+						Value: utils.GetStringPtr("us-east-2"),
 					},
 					MetaOpts: &MetaOptions{
 						BucketOwner: "root",

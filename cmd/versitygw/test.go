@@ -39,6 +39,7 @@ var (
 	versioningEnabled bool
 	azureTests        bool
 	tlsStatus         bool
+	parallel          bool
 )
 
 func testCommand() *cli.Command {
@@ -115,6 +116,12 @@ func initTestCommands() []*cli.Command {
 					Destination: &azureTests,
 					Aliases:     []string{"azure"},
 				},
+				&cli.BoolFlag{
+					Name:        "parallel",
+					Usage:       "executes the tests concurrently",
+					Destination: &parallel,
+					Aliases:     []string{"p"},
+				},
 			},
 		},
 		{
@@ -144,6 +151,11 @@ func initTestCommands() []*cli.Command {
 			Name:   "access-control",
 			Usage:  "Tests gateway access control with bucket ACLs and Policies",
 			Action: getAction(integration.TestAccessControl),
+		},
+		{
+			Name:   "noacl",
+			Usage:  "Tests gateway in ACL-disabled mode",
+			Action: getAction(integration.TestNoAclMode),
 		},
 		{
 			Name:  "bench",
@@ -304,9 +316,9 @@ func initTestCommands() []*cli.Command {
 	}, extractIntTests()...)
 }
 
-type testFunc func(*integration.S3Conf)
+type testFunc func(*integration.TestState)
 
-func getAction(tf testFunc) func(*cli.Context) error {
+func getAction(tf testFunc) func(ctx *cli.Context) error {
 	return func(ctx *cli.Context) error {
 		opts := []integration.Option{
 			integration.WithAccess(awsID),
@@ -329,12 +341,14 @@ func getAction(tf testFunc) func(*cli.Context) error {
 		}
 
 		s := integration.NewS3Conf(opts...)
-		tf(s)
+		ts := integration.NewTestState(ctx.Context, s, parallel)
+		tf(ts)
+		ts.Wait()
 
 		fmt.Println()
-		fmt.Println("RAN:", integration.RunCount, "PASS:", integration.PassCount, "FAIL:", integration.FailCount)
-		if integration.FailCount > 0 {
-			return fmt.Errorf("test failed with %v errors", integration.FailCount)
+		fmt.Println("RAN:", integration.RunCount.Load(), "PASS:", integration.PassCount.Load(), "FAIL:", integration.FailCount.Load())
+		if integration.FailCount.Load() > 0 {
+			return fmt.Errorf("test failed with %v errors", integration.FailCount.Load())
 		}
 		return nil
 	}
@@ -365,6 +379,9 @@ func extractIntTests() (commands []*cli.Command) {
 				if hostStyle {
 					opts = append(opts, integration.WithHostStyle())
 				}
+				if azureTests {
+					opts = append(opts, integration.WithAzureMode())
+				}
 
 				s := integration.NewS3Conf(opts...)
 				err := testFunc(s)
@@ -376,6 +393,12 @@ func extractIntTests() (commands []*cli.Command) {
 					Usage:       "Test the bucket object versioning, if the versioning is enabled",
 					Destination: &versioningEnabled,
 					Aliases:     []string{"vs"},
+				},
+				&cli.BoolFlag{
+					Name:        "azure-test-mode",
+					Usage:       "Skips tests that are not supported by Azure",
+					Destination: &azureTests,
+					Aliases:     []string{"azure"},
 				},
 			},
 		})

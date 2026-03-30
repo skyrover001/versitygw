@@ -61,7 +61,11 @@ send_rest_command() {
     fi
     log 5 "output file: $output_file"
   else
-    output_file="$TEST_FILE_FOLDER/output.txt"
+    if ! file_name=$(get_file_name 2>&1); then
+      log 2 "error getting file name: $file_name"
+      return 1
+    fi
+    output_file="$TEST_FILE_FOLDER/$file_name"
   fi
   local env_array=("env" "COMMAND_LOG=$COMMAND_LOG" "OUTPUT_FILE=$output_file")
   if [ "$1" != "" ]; then
@@ -103,7 +107,7 @@ check_rest_expected_header_error() {
   status_message=$(echo "$status_line" | cut -d' ' -f3- | tr -d '\r')
   log 5 "status code: $status_code, status message: $status_message"
   if [ "$2" != "$status_code" ]; then
-    log 2 "expected curl response '$2', was '$status_code'"
+    log 2 "expected curl response '$2', was '$status_code' ($(echo -n "$result"))"
     return 1
   fi
   if [ "$status_message" != "$3" ]; then
@@ -147,7 +151,11 @@ send_rest_command_expect_success_callback() {
   if ! check_param_count_v2 "env vars, script, response code, callback fn" 4 $#; then
     return 1
   fi
-  output_file="$TEST_FILE_FOLDER/output.txt"
+  if ! output_file_name=$(get_file_name 2>&1); then
+    log 2 "error generating output file name: $output_file_name"
+    return 1
+  fi
+  output_file="$TEST_FILE_FOLDER/$output_file_name"
   local env_array=("env" "COMMAND_LOG=$COMMAND_LOG" "OUTPUT_FILE=$output_file")
   if [ "$1" != "" ]; then
     IFS=' ' read -r -a env_vars <<< "$1"
@@ -158,11 +166,12 @@ send_rest_command_expect_success_callback() {
     log 2 "error sending command: $result"
     return 1
   fi
-  if [ "$result" != "$3" ]; then
-    log 2 "expected '$3', was '$result' ($(cat "$TEST_FILE_FOLDER/output.txt"))"
+  response_code="$(echo "$result" | tail -n 1)"
+  if [ "$response_code" != "$3" ]; then
+    log 2 "expected '$3', was '$response_code' ($(cat "$output_file"))"
     return 1
   fi
-  if [ "$4" != "" ] && ! "$4" "$TEST_FILE_FOLDER/output.txt"; then
+  if [ "$4" != "" ] && ! "$4" "$output_file"; then
     log 2 "callback error"
     return 1
   fi
@@ -170,17 +179,23 @@ send_rest_command_expect_success_callback() {
 }
 
 rest_go_command_perform_send() {
-  if ! curl_command=$(go run ./tests/rest_scripts/generate_command.go -awsAccessKeyId "$AWS_ACCESS_KEY_ID" -awsSecretAccessKey "$AWS_SECRET_ACCESS_KEY" -url "$AWS_ENDPOINT_URL" "$@" 2>&1); then
+  if ! xml_file=$(get_file_name 2>&1); then
+    log 2 "error getting XML file name: $xml_file"
+    return 1
+  fi
+  if ! curl_command=$(go run ./tests/rest_scripts/generateCommand.go -awsAccessKeyId "$AWS_ACCESS_KEY_ID" -awsSecretAccessKey "$AWS_SECRET_ACCESS_KEY" -awsRegion "$AWS_REGION" -url "$AWS_ENDPOINT_URL" "-writeXMLPayloadToFile" "$xml_file" "$@" 2>&1); then
     log 2 "error: $curl_command"
     return 1
   fi
-  local full_command="send_command $curl_command"
-  log 5 "full command: $full_command"
-  if ! result=$(eval "${full_command[*]}" 2>&1); then
-    log 3 "error sending command: $result"
+  curl_command=$(echo -n "$curl_command" | tr -d '\n')
+  mapfile -t curl_command_array < <(
+    printf '%s' "$curl_command" | python3 -c 'import shlex, sys; [print(arg) for arg in shlex.split(sys.stdin.read())]'
+  )
+  if ! result=$(send_command "${curl_command_array[@]}" 2>&1); then
+    log 2 "error sending command: $result"
     return 1
   fi
-  log 5 "result: $result"
+  echo "$result"
 }
 
 send_rest_go_command_expect_error() {
@@ -200,16 +215,34 @@ send_rest_go_command_expect_error_callback() {
     log 2 "'send_rest_go_command_expect_error' param count must be 4 or greater, even (expected HTTP code, expected error code, expected message, callback, go params)"
     return 1
   fi
-  if ! rest_go_command_perform_send "${@:5}"; then
-    log 2 "error sending rest go command"
+
+  local all_params=("${@:5}") no_callback_params=0 go_param_array=() callback_params=()
+
+  if ! params_file=$(get_file_name 2>&1); then
+    log 2 "error getting params file name: $params_file"
     return 1
   fi
-  echo -n "$result" > "$TEST_FILE_FOLDER/result.txt"
-  if ! check_rest_go_expected_error "$TEST_FILE_FOLDER/result.txt" "$1" "$2" "$3"; then
+  get_go_params "${all_params[@]}" > "$TEST_FILE_FOLDER/$params_file" || no_callback_params=$?
+  mapfile -t go_param_array < "$TEST_FILE_FOLDER/$params_file"
+
+  if [ "$no_callback_params" -eq 1 ]; then
+    mapfile -t callback_params < <(get_callback_params "${all_params[@]}")
+  fi
+
+  if ! result=$(rest_go_command_perform_send "${go_param_array[@]}" 2>&1); then
+    log 2 "error sending rest go command: $result"
+    return 1
+  fi
+  if ! file_name=$(get_file_name 2>&1); then
+    log 2 "error getting file name: $file_name"
+    return 1
+  fi
+  echo -n "$result" > "$TEST_FILE_FOLDER/$file_name"
+  if ! check_rest_go_expected_error "$TEST_FILE_FOLDER/$file_name" "$1" "$2" "$3"; then
     log 2 "error checking expected header error"
     return 1
   fi
-  if [ "$4" != "" ] && ! "$4" "$TEST_FILE_FOLDER/result.txt"; then
+  if [ "$4" != "" ] && ! "$4" "$TEST_FILE_FOLDER/$file_name" "${callback_params[@]}"; then
     log 2 "callback error"
     return 1
   fi
@@ -248,11 +281,50 @@ send_rest_go_command() {
   return 0
 }
 
+# return 0 for callback params, 1 for only go params
+get_go_params() {
+  for param in "$@"; do
+    if [[ "$param" == "--" ]]; then
+      return 1
+    fi
+    echo "$param"
+  done
+  return 0
+}
+
+get_callback_params() {
+  delimiter_found=false
+  for param in "$@"; do
+    if [ "$delimiter_found" == "true" ]; then
+      echo "$param"
+      continue
+    fi
+    if [ "$param" == "--" ]; then
+      delimiter_found=true
+    fi
+  done
+  return 0
+}
+
 send_rest_go_command_callback() {
   if ! check_param_count_gt "response code, callback, params" 2 $#; then
     return 1
   fi
-  if ! rest_go_command_perform_send "${@:3}"; then
+
+  local all_params=("${@:3}") no_callback_params=0 go_param_array=() callback_params=()
+
+  if ! params_file=$(get_file_name 2>&1); then
+    log 2 "error getting params file name: $params_file"
+    return 1
+  fi
+  get_go_params "${all_params[@]}" > "$TEST_FILE_FOLDER/$params_file" || no_callback_params=$?
+  mapfile -t go_param_array < "$TEST_FILE_FOLDER/$params_file"
+
+  if [ "$no_callback_params" -eq 1 ]; then
+    mapfile -t callback_params < <(get_callback_params "${all_params[@]}")
+  fi
+
+  if ! rest_go_command_perform_send "${go_param_array[@]}"; then
     log 2 "error sending rest go command"
     return 1
   fi
@@ -264,10 +336,327 @@ send_rest_go_command_callback() {
     log 2 "expected curl response '$1', was '$status_code'"
     return 1
   fi
-  echo -n "$result" > "$TEST_FILE_FOLDER/result.txt"
-  if [ "$2" != "" ] && ! "$2" "$TEST_FILE_FOLDER/result.txt"; then
+  if ! output_file_name=$(get_file_name); then
+    log 2 "error generating output file name: $output_file_name"
+    return 1
+  fi
+  echo -n "$result" > "$TEST_FILE_FOLDER/$output_file_name"
+  if [ "$2" != "" ] && ! "$2" "$TEST_FILE_FOLDER/$output_file_name" "${callback_params[@]}"; then
     log 2 "error in callback"
     return 1
   fi
+  return 0
+}
+
+# return 0 for key match, 1 for no key match, 2 for value mismatch
+check_key_and_value_pair_for_match() {
+  if ! check_param_count_v2 "read key, read value, expected key, expected value" 4 $#; then
+    return 2
+  fi
+  if [ "${1,,}" == "${3,,}" ]; then
+    if [ "$2" != "$4" ]; then
+      log 2 "expected value of '$4', was '$2'"
+      return 2
+    fi
+    return 0
+  fi
+  return 1
+}
+
+check_for_header_key_and_value() {
+  if ! check_param_count_v2 "data file, header key, header value" 3 $#; then
+    return 1
+  fi
+  while IFS=$': \r' read -r key value; do
+    local check_result=0
+    check_key_and_value_pair_for_match "$key" "$value" "$2" "$3" || check_result=$?
+    if [ "$check_result" -eq 2 ]; then
+      return 1
+    elif [ "$check_result" -eq 0 ]; then
+      return 0
+    fi
+  done <<< "$(grep -E '^.+: .+$' "$1")"
+  log 2 "no header key '$2' found"
+  return 1
+}
+
+check_argument_name_and_value() {
+  if ! check_param_count_v2 "data file, argument name, argument value" 3 $#; then
+    return 1
+  fi
+  if ! xml_data=$(print_xml_data_to_file "$1" 2>&1); then
+    log 2 "error getting XML data: $xml_data"
+    return 1
+  fi
+  if ! check_error_parameter "$xml_data" "ArgumentName" "$2"; then
+    log 2 "error checking 'ArgumentName' parameter"
+    return 1
+  fi
+  if ! check_error_parameter "$xml_data" "ArgumentValue" "$3"; then
+    log 2 "error checking 'ArgumentValue' parameter"
+    return 1
+  fi
+  return 0
+}
+
+send_rest_go_command_expect_error_with_arg_name_value() {
+  if ! check_param_count_gt "response code, error code, message, arg name, arg value, params" 5 $#; then
+    return 1
+  fi
+  if ! send_rest_go_command_expect_error_callback "$1" "$2" "$3" "check_argument_name_and_value" "${@:6}" "--" "$4" "$5"; then
+    log 2 "error checking error response values"
+    return 1
+  fi
+  return 0
+}
+
+check_specific_argument_name_and_value() {
+  if ! check_param_count_v2 "data file, argument name, value" 3 $#; then
+    return 1
+  fi
+  if ! check_error_parameter "$1" "$2" "$3"; then
+    log 2 "error checking '$2' parameter"
+    return 1
+  fi
+}
+
+send_rest_go_command_expect_error_with_specific_arg_name_value() {
+  if ! check_param_count_gt "response code, error code, message, arg name, arg value, params" 5 $#; then
+    return 1
+  fi
+  if ! send_rest_go_command_expect_error_callback "$1" "$2" "$3" "check_specific_argument_name_and_value" "${@:6}" "--" "$4" "$5"; then
+    log 2 "error checking error response values"
+    return 1
+  fi
+  return 0
+}
+
+check_specific_argument_names_and_values() {
+  if ! check_param_count_v2 "data file" 1 $#; then
+    return 1
+  fi
+  for ((idx=0; idx<${#arg_names_and_values[@]}; idx+=2)); do
+    if ! check_error_parameter "$1" "${arg_names_and_values[$idx]}" "${arg_names_and_values[(($idx+1))]}"; then
+      log 2 "error checking '${arg_names_and_values[$idx]}' parameter"
+      return 1
+    fi
+  done
+}
+
+send_rest_go_command_expect_error_with_specific_arg_names_values() {
+  if ! check_param_count_gt "response code, error code, message, arg count, pairs of arg names and values, params" 6 $#; then
+    return 1
+  fi
+  arg_names_and_values=("${@:5:$4}")
+  if ! send_rest_go_command_expect_error_callback "$1" "$2" "$3" "check_specific_argument_names_and_values" "${@:((5+$4))}"; then
+    log 2 "error checking error response values"
+    return 1
+  fi
+  return 0
+}
+
+check_header_key_and_value() {
+  if ! check_param_count_v2 "data file" 1 $#; then
+    return 1
+  fi
+  if ! check_for_header_key_and_value "$1" "$header_key" "$header_value"; then
+    log 2 "error checking header key and value"
+    return 1
+  fi
+  return 0
+}
+
+send_rest_go_command_check_header_key_and_value() {
+  if ! check_param_count_gt "response code, header key, header values, params" 3 $#; then
+    return 1
+  fi
+  header_key="$2"
+  header_value="$3"
+  if ! send_rest_go_command_callback "$1" "check_header_key_and_value" "${@:4}"; then
+    log 2 "error sending command and checking header key and value"
+    return 1
+  fi
+  return 0
+}
+
+send_rest_go_command_write_response_to_file() {
+  if ! check_param_count_gt "file, params" 2 $#; then
+    return 1
+  fi
+  if ! rest_go_command_perform_send "${@:2}"; then
+    log 2 "error sending rest go command"
+    return 1
+  fi
+  echo -n "$result" > "$1"
+  return 0
+}
+
+check_header_keys_and_values() {
+  if ! check_param_count_gt "data file, header/key value pairs" 1 $#; then
+    return 1
+  fi
+
+  local data_file="$1"
+  local pairs=("${@:2}")
+  local check_result=0
+  local remaining_pairs=""
+  local line=""
+  local key=""
+  local value=""
+
+  # Parse header lines until the blank line separator.
+  # - Split on the first ':'
+  # - Allow empty values (e.g. "X-Foo:")
+  # - Preserve spaces in values
+  while IFS= read -r line; do
+    line="${line%$'\r'}"
+
+    # End of headers
+    if [ -z "$line" ]; then
+      break
+    fi
+
+    # Require at least one ':' to treat as a header field
+    case "$line" in
+      *:*) ;;
+      *) continue ;;
+    esac
+
+    key="${line%%:*}"
+    value="${line#*:}"
+    value="${value# }"
+
+    check_result=0
+    if remaining_pairs=$(check_for_key_and_value_within_pairs "$key" "$value" "${pairs[@]}"); then
+      # match found; remaining_pairs contains the updated list
+      pairs=()
+      if [ -n "$remaining_pairs" ]; then
+        while IFS= read -r line; do
+          pairs+=("$line")
+        done <<< "$remaining_pairs"
+      fi
+
+      if [ "${#pairs[@]}" -eq 0 ]; then
+        return 0
+      fi
+    else
+      check_result=$?
+      if [ "$check_result" -eq 2 ]; then
+        log 2 "error checking pair"
+        return 1
+      fi
+      # check_result==1 means no match; keep current pairs
+    fi
+  done < "$data_file"
+
+  if [ "${#pairs[@]}" -eq 0 ]; then
+    return 0
+  fi
+  log 2 "missing expected header key '${pairs[0]}'"
+  return 1
+}
+
+# Check that a specific header key/value pair (or pairs) is NOT present.
+# Returns:
+#   0 - none of the specified pairs are present
+#   1 - at least one specified pair is present
+#   2 - other error (param count, malformed pairs)
+check_header_keys_and_values_not_present() {
+  if ! check_param_count_gt "data file, header/key value pairs" 1 $#; then
+    return 2
+  fi
+
+  local data_file="$1"
+  shift 1
+
+  if [ $(( $# % 2 )) -ne 0 ]; then
+    log 2 "header key/value pairs must be even count"
+    return 2
+  fi
+
+  local expected_pairs=("$@")
+  local line=""
+  local key=""
+  local value=""
+
+  while IFS= read -r line; do
+    line="${line%$'\r'}"
+
+    # End of headers
+    if [ -z "$line" ]; then
+      break
+    fi
+
+    case "$line" in
+      *:*) ;;
+      *) continue ;;
+    esac
+
+    key="${line%%:*}"
+    value="${line#*:}"
+    value="${value# }"
+
+    local idx
+    for ((idx=0; idx<${#expected_pairs[@]}; idx+=2)); do
+      local exp_key="${expected_pairs[$idx]}"
+      local exp_val="${expected_pairs[$((idx+1))]}"
+
+      if [ "${key,,}" = "${exp_key,,}" ] && [ "$value" = "$exp_val" ]; then
+        log 2 "unexpected header pair present: '$exp_key: $exp_val'"
+        return 1
+      fi
+    done
+  done < "$data_file"
+
+  return 0
+}
+
+check_for_key_and_value_within_pairs() {
+  if ! check_param_count_gt "read key, read value, full set of key/value pairs" 2 $#; then
+    return 2
+  fi
+
+  local read_key="$1"
+  local read_value="$2"
+  shift 2
+
+  # Require an even number of remaining args (key/value pairs)
+  if [ $(( $# % 2 )) -ne 0 ]; then
+    log 2 "key/value pairs must be even count"
+    return 2
+  fi
+
+  local pairs=()
+  local omit_idx=-1
+  local idx=0
+  while [ $# -gt 0 ]; do
+    local key="$1"
+    local value="$2"
+    local check_result=0
+
+    pairs+=("$key" "$value")
+    check_key_and_value_pair_for_match "$read_key" "$read_value" "$key" "$value" || check_result=$?
+    if [ "$check_result" -eq 2 ]; then
+      return 2
+    elif [ "$check_result" -eq 0 ]; then
+      # Omit the last matching pair (preserves previous behavior)
+      omit_idx=$idx
+    fi
+
+    idx=$((idx + 2))
+    shift 2
+  done
+
+  if [ "$omit_idx" -lt 0 ]; then
+    return 1
+  fi
+
+  for ((idx=0; idx<${#pairs[@]}; idx+=2)); do
+    if [ "$idx" -eq "$omit_idx" ]; then
+      continue
+    fi
+    echo "${pairs[$idx]}"
+    echo "${pairs[$((idx+1))]}"
+  done
   return 0
 }

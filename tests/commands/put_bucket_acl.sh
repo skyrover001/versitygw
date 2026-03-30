@@ -21,7 +21,6 @@ source ./tests/drivers/rest.sh
 
 put_bucket_acl_s3api() {
   log 6 "put_bucket_acl_s3api"
-  record_command "put-bucket-acl" "client:s3api"
   if [[ $# -ne 2 ]]; then
     log 2 "put bucket acl command requires bucket name, acl file"
     return 1
@@ -36,7 +35,6 @@ put_bucket_acl_s3api() {
 
 put_bucket_acl_s3api_with_user() {
   log 6 "put_bucket_acl_s3api_with_user"
-  record_command "put-bucket-acl" "client:s3api"
   if [[ $# -ne 4 ]]; then
     log 2 "put bucket acl command requires bucket name, acl file, username, password"
     return 1
@@ -69,7 +67,7 @@ reset_bucket_acl() {
     log 2 "error resetting direct ACL"
     return 1
   fi
-  if ! put_bucket_acl_rest "$BUCKET_ONE_NAME" "$TEST_FILE_FOLDER/$acl_file"; then
+  if ! put_bucket_acl_rest "$1" "$TEST_FILE_FOLDER/$acl_file"; then
     log 2 "error putting bucket acl (s3api)"
     return 1
   fi
@@ -78,7 +76,6 @@ reset_bucket_acl() {
 }
 
 put_bucket_canned_acl_s3cmd() {
-  record_command "put-bucket-acl" "client:s3cmd"
   if [[ $# -ne 2 ]]; then
     log 2 "put bucket acl command requires bucket name, permission"
     return 1
@@ -95,7 +92,6 @@ put_bucket_canned_acl() {
     log 2 "'put bucket canned acl' command requires bucket name, canned ACL"
     return 1
   fi
-  record_command "put-bucket-acl" "client:s3api"
   if ! error=$(send_command aws --no-verify-ssl s3api put-bucket-acl --bucket "$1" --acl "$2" 2>&1); then
     log 2 "error re-setting bucket acls: $error"
     return 1
@@ -108,7 +104,6 @@ put_bucket_canned_acl_with_user() {
     log 2 "'put bucket canned acl with user' command requires bucket name, canned ACL, username, password"
     return 1
   fi
-  record_command "put-bucket-acl" "client:s3api"
   if ! error=$(AWS_ACCESS_KEY_ID="$3" AWS_SECRET_ACCESS_KEY="$4" send_command aws --no-verify-ssl s3api put-bucket-acl --bucket "$1" --acl "$2" 2>&1); then
     log 2 "error re-setting bucket acls: $error"
     return 1

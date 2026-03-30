@@ -15,7 +15,9 @@
 package auth
 
 import (
+	"crypto/tls"
 	"fmt"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,57 +28,82 @@ import (
 )
 
 type LdapIAMService struct {
-	conn       *ldap.Conn
-	queryBase  string
-	objClasses []string
-	accessAtr  string
-	secretAtr  string
-	roleAtr    string
-	groupIdAtr string
-	userIdAtr  string
-	rootAcc    Account
-	url        string
-	bindDN     string
-	pass       string
-	mu         sync.Mutex
+	conn          *ldap.Conn
+	queryBase     string
+	objClasses    []string
+	accessAtr     string
+	secretAtr     string
+	roleAtr       string
+	groupIdAtr    string
+	userIdAtr     string
+	projectIdAtr  string
+	rootAcc       Account
+	url           string
+	bindDN        string
+	pass          string
+	tlsSkipVerify bool
+	mu            sync.Mutex
 }
 
 var _ IAMService = &LdapIAMService{}
 
-func NewLDAPService(rootAcc Account, url, bindDN, pass, queryBase, accAtr, secAtr, roleAtr, userIdAtr, groupIdAtr, objClasses string) (IAMService, error) {
-	if url == "" || bindDN == "" || pass == "" || queryBase == "" || accAtr == "" ||
-		secAtr == "" || roleAtr == "" || userIdAtr == "" || groupIdAtr == "" || objClasses == "" {
+func NewLDAPService(rootAcc Account, ldapURL, bindDN, pass, queryBase, accAtr, secAtr, roleAtr, userIdAtr, groupIdAtr, projectIdAtr, objClasses string, tlsSkipVerify bool) (IAMService, error) {
+	if ldapURL == "" || bindDN == "" || pass == "" || queryBase == "" || accAtr == "" ||
+		secAtr == "" || roleAtr == "" || userIdAtr == "" || groupIdAtr == "" || projectIdAtr == "" || objClasses == "" {
 		return nil, fmt.Errorf("required parameters list not fully provided")
 	}
-	conn, err := ldap.DialURL(url)
+
+	conn, err := dialLDAP(ldapURL, tlsSkipVerify)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to LDAP server: %w", err)
 	}
 
 	err = conn.Bind(bindDN, pass)
 	if err != nil {
+		conn.Close()
 		return nil, fmt.Errorf("failed to bind to LDAP server %w", err)
 	}
 	return &LdapIAMService{
-		conn:       conn,
-		queryBase:  queryBase,
-		objClasses: strings.Split(objClasses, ","),
-		accessAtr:  accAtr,
-		secretAtr:  secAtr,
-		roleAtr:    roleAtr,
-		userIdAtr:  userIdAtr,
-		groupIdAtr: groupIdAtr,
-		rootAcc:    rootAcc,
-		url:        url,
-		bindDN:     bindDN,
-		pass:       pass,
+		conn:          conn,
+		queryBase:     queryBase,
+		objClasses:    strings.Split(objClasses, ","),
+		accessAtr:     accAtr,
+		secretAtr:     secAtr,
+		roleAtr:       roleAtr,
+		userIdAtr:     userIdAtr,
+		groupIdAtr:    groupIdAtr,
+		projectIdAtr:  projectIdAtr,
+		rootAcc:       rootAcc,
+		url:           ldapURL,
+		bindDN:        bindDN,
+		pass:          pass,
+		tlsSkipVerify: tlsSkipVerify,
 	}, nil
+}
+
+// dialLDAP establishes an LDAP connection with optional TLS configuration
+func dialLDAP(ldapURL string, tlsSkipVerify bool) (*ldap.Conn, error) {
+	u, err := url.Parse(ldapURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid LDAP URL: %w", err)
+	}
+
+	// For ldaps:// URLs, use DialURL with custom TLS config if needed
+	if u.Scheme == "ldaps" && tlsSkipVerify {
+		tlsConfig := &tls.Config{
+			InsecureSkipVerify: tlsSkipVerify,
+		}
+		return ldap.DialURL(ldapURL, ldap.DialWithTLSConfig(tlsConfig))
+	}
+
+	// For ldap:// or when TLS verification is enabled, use standard DialURL
+	return ldap.DialURL(ldapURL)
 }
 
 func (ld *LdapIAMService) reconnect() error {
 	ld.conn.Close()
 
-	conn, err := ldap.DialURL(ld.url)
+	conn, err := dialLDAP(ld.url, ld.tlsSkipVerify)
 	if err != nil {
 		return fmt.Errorf("failed to reconnect to LDAP server: %w", err)
 	}
@@ -117,6 +144,7 @@ func (ld *LdapIAMService) CreateAccount(account Account) error {
 	userEntry.Attribute(ld.roleAtr, []string{string(account.Role)})
 	userEntry.Attribute(ld.groupIdAtr, []string{fmt.Sprint(account.GroupID)})
 	userEntry.Attribute(ld.userIdAtr, []string{fmt.Sprint(account.UserID)})
+	userEntry.Attribute(ld.projectIdAtr, []string{fmt.Sprint(account.ProjectID)})
 
 	err := ld.execute(func(c *ldap.Conn) error {
 		return c.Add(userEntry)
@@ -152,7 +180,7 @@ func (ld *LdapIAMService) GetUserAccount(access string) (Account, error) {
 		0,
 		false,
 		ld.buildSearchFilter(access),
-		[]string{ld.accessAtr, ld.secretAtr, ld.roleAtr, ld.userIdAtr, ld.groupIdAtr},
+		[]string{ld.accessAtr, ld.secretAtr, ld.roleAtr, ld.userIdAtr, ld.groupIdAtr, ld.projectIdAtr},
 		nil,
 	)
 
@@ -191,12 +219,19 @@ func (ld *LdapIAMService) GetUserAccount(access string) (Account, error) {
 		return Account{}, fmt.Errorf("invalid entry value for user-id %q: %w",
 			entry.GetAttributeValue(ld.userIdAtr), err)
 	}
+	projectID, err := strconv.Atoi(entry.GetAttributeValue(ld.projectIdAtr))
+	if err != nil {
+		return Account{}, fmt.Errorf("invalid entry value for project-id %q: %w",
+			entry.GetAttributeValue(ld.projectIdAtr), err)
+	}
+
 	return Account{
-		Access:  entry.GetAttributeValue(ld.accessAtr),
-		Secret:  entry.GetAttributeValue(ld.secretAtr),
-		Role:    Role(entry.GetAttributeValue(ld.roleAtr)),
-		GroupID: groupId,
-		UserID:  userId,
+		Access:    entry.GetAttributeValue(ld.accessAtr),
+		Secret:    entry.GetAttributeValue(ld.secretAtr),
+		Role:      Role(entry.GetAttributeValue(ld.roleAtr)),
+		GroupID:   groupId,
+		UserID:    userId,
+		ProjectID: projectID,
 	}, nil
 }
 
@@ -210,6 +245,9 @@ func (ld *LdapIAMService) UpdateUserAccount(access string, props MutableProps) e
 	}
 	if props.UserID != nil {
 		req.Replace(ld.userIdAtr, []string{fmt.Sprint(*props.UserID)})
+	}
+	if props.ProjectID != nil {
+		req.Replace(ld.projectIdAtr, []string{fmt.Sprint(*props.ProjectID)})
 	}
 	if props.Role != "" {
 		req.Replace(ld.roleAtr, []string{string(props.Role)})
@@ -248,7 +286,7 @@ func (ld *LdapIAMService) ListUserAccounts() ([]Account, error) {
 		0,
 		false,
 		ld.buildSearchFilter(""),
-		[]string{ld.accessAtr, ld.secretAtr, ld.roleAtr, ld.groupIdAtr, ld.userIdAtr},
+		[]string{ld.accessAtr, ld.secretAtr, ld.roleAtr, ld.groupIdAtr, ld.projectIdAtr, ld.userIdAtr},
 		nil,
 	)
 
@@ -273,12 +311,19 @@ func (ld *LdapIAMService) ListUserAccounts() ([]Account, error) {
 			return nil, fmt.Errorf("invalid entry value for user-id %q: %w",
 				el.GetAttributeValue(ld.userIdAtr), err)
 		}
+		projectID, err := strconv.Atoi(el.GetAttributeValue(ld.projectIdAtr))
+		if err != nil {
+			return nil, fmt.Errorf("invalid entry value for project-id %q: %w",
+				el.GetAttributeValue(ld.groupIdAtr), err)
+		}
+
 		result = append(result, Account{
-			Access:  el.GetAttributeValue(ld.accessAtr),
-			Secret:  el.GetAttributeValue(ld.secretAtr),
-			Role:    Role(el.GetAttributeValue(ld.roleAtr)),
-			GroupID: groupId,
-			UserID:  userId,
+			Access:    el.GetAttributeValue(ld.accessAtr),
+			Secret:    el.GetAttributeValue(ld.secretAtr),
+			Role:      Role(el.GetAttributeValue(ld.roleAtr)),
+			GroupID:   groupId,
+			ProjectID: projectID,
+			UserID:    userId,
 		})
 	}
 

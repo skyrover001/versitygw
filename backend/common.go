@@ -38,8 +38,7 @@ import (
 
 const (
 	// this is the media type for directories in AWS and Nextcloud
-	DirContentType     = "application/x-directory"
-	DefaultContentType = "binary/octet-stream"
+	DirContentType = "application/x-directory"
 
 	// this is the minimum allowed size for mp parts
 	MinPartSize = 5 * 1024 * 1024
@@ -247,6 +246,17 @@ func ParseCopySource(copySourceHeader string) (string, string, string, error) {
 		return "", "", "", s3err.GetAPIError(s3err.ErrInvalidCopySourceBucket)
 	}
 
+	var err error
+	// URL-decode the bucket and object names to handle special characters
+	srcBucket, err = url.QueryUnescape(srcBucket)
+	if err != nil {
+		return "", "", "", s3err.GetAPIError(s3err.ErrInvalidCopySourceEncoding)
+	}
+	srcObject, err = url.QueryUnescape(srcObject)
+	if err != nil {
+		return "", "", "", s3err.GetAPIError(s3err.ErrInvalidCopySourceEncoding)
+	}
+
 	return srcBucket, srcObject, versionId, nil
 }
 
@@ -317,14 +327,60 @@ func ParseObjectTags(tagging string) (map[string]string, error) {
 	return tagSet, nil
 }
 
-var validTagComponent = regexp.MustCompile(`^[a-zA-Z0-9:/_.\-+ ]+$`)
-
-// isValidTagComponent matches strings which contain letters, decimal digits,
-// and special chars: '/', '_', '-', '+', '.', ' ' (space)
-func isValidTagComponent(str string) bool {
-	if str == "" {
-		return true
+// ParseCreateBucketTags parses and validates the bucket
+// tagging from CreateBucket input
+func ParseCreateBucketTags(tagging []types.Tag) (map[string]string, error) {
+	if len(tagging) == 0 {
+		return nil, nil
 	}
+
+	tagset := make(map[string]string, len(tagging))
+
+	if len(tagging) > 50 {
+		return nil, s3err.GetAPIError(s3err.ErrBucketTaggingLimited)
+	}
+
+	for _, tag := range tagging {
+		// validate tag key length
+		key := GetStringFromPtr(tag.Key)
+		if len(key) == 0 || len(key) > 128 {
+			return nil, s3err.GetAPIError(s3err.ErrInvalidTagKey)
+		}
+
+		// validate tag key string chars
+		if !isValidTagComponent(key) {
+			return nil, s3err.GetAPIError(s3err.ErrInvalidTagKey)
+		}
+
+		// validate tag value length
+		value := GetStringFromPtr(tag.Value)
+		if len(value) > 256 {
+			return nil, s3err.GetAPIError(s3err.ErrInvalidTagValue)
+		}
+
+		// validate tag value string chars
+		if !isValidTagComponent(value) {
+			return nil, s3err.GetAPIError(s3err.ErrInvalidTagValue)
+		}
+
+		// make sure there are no duplicate keys
+		_, ok := tagset[key]
+		if ok {
+			return nil, s3err.GetAPIError(s3err.ErrDuplicateTagKey)
+		}
+
+		tagset[key] = value
+	}
+
+	return tagset, nil
+}
+
+// tag component (key/value) name rule regexp
+// https://docs.aws.amazon.com/AmazonS3/latest/API/API_control_Tag.html
+var validTagComponent = regexp.MustCompile(`^([\p{L}\p{Z}\p{N}_.:/=+\-@]*)$`)
+
+// isValidTagComponent validates the tag component(key/value) name
+func isValidTagComponent(str string) bool {
 	return validTagComponent.Match([]byte(str))
 }
 
@@ -449,6 +505,8 @@ func EvaluatePreconditions(etag string, modTime time.Time, preconditions PreCond
 		return nil
 	}
 
+	etag = strings.Trim(etag, `"`)
+
 	// convert all conditions to *bool to evaluate the conditions
 	var ifMatch, ifNoneMatch, ifModSince, ifUnmodeSince *bool
 	if preconditions.IfMatch != nil {
@@ -535,11 +593,44 @@ func EvaluatePreconditions(etag string, modTime time.Time, preconditions PreCond
 
 // EvaluateMatchPreconditions evaluates if-match and if-none-match preconditions
 func EvaluateMatchPreconditions(etag string, ifMatch, ifNoneMatch *string) error {
+	etag = strings.Trim(etag, `"`)
 	if ifMatch != nil && *ifMatch != etag {
 		return errPreconditionFailed
 	}
 	if ifNoneMatch != nil && *ifNoneMatch == etag {
 		return errPreconditionFailed
+	}
+
+	return nil
+}
+
+// EvaluateObjectPutPreconditions evaluates if-match and if-none-match preconditions
+// for object PUT(PutObject, CompleteMultipartUpload) actions
+func EvaluateObjectPutPreconditions(etag string, ifMatch, ifNoneMatch *string, objExists bool) error {
+	if ifMatch == nil && ifNoneMatch == nil {
+		return nil
+	}
+
+	if ifNoneMatch != nil && *ifNoneMatch != "*" {
+		return s3err.GetAPIError(s3err.ErrNotImplemented)
+	}
+
+	if ifNoneMatch != nil && ifMatch != nil {
+		return s3err.GetAPIError(s3err.ErrNotImplemented)
+	}
+
+	if ifNoneMatch != nil && objExists {
+		return s3err.GetAPIError(s3err.ErrPreconditionFailed)
+	}
+
+	if ifMatch != nil && !objExists {
+		return s3err.GetAPIError(s3err.ErrNoSuchKey)
+	}
+
+	etag = strings.Trim(etag, `"`)
+
+	if ifMatch != nil && *ifMatch != etag {
+		return s3err.GetAPIError(s3err.ErrPreconditionFailed)
 	}
 
 	return nil
@@ -553,6 +644,7 @@ type ObjectDeletePreconditions struct {
 
 // EvaluateObjectDeletePreconditions evaluates preconditions for DeleteObject
 func EvaluateObjectDeletePreconditions(etag string, modTime time.Time, size int64, preconditions ObjectDeletePreconditions) error {
+	etag = strings.Trim(etag, `"`)
 	ifMatch := preconditions.IfMatch
 	if ifMatch != nil && *ifMatch != etag {
 		return errPreconditionFailed
@@ -569,4 +661,20 @@ func EvaluateObjectDeletePreconditions(etag string, modTime time.Time, size int6
 	}
 
 	return nil
+}
+
+// IsValidDirectoryName returns true if the string is a valid name
+// for a directory
+func IsValidDirectoryName(name string) bool {
+	// directories may not contain a path separator
+	if strings.ContainsRune(name, '/') {
+		return false
+	}
+
+	// directories may not contain null character
+	if strings.ContainsRune(name, 0) {
+		return false
+	}
+
+	return true
 }

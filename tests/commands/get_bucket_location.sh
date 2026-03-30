@@ -15,7 +15,6 @@
 # under the License.
 
 get_bucket_location() {
-  record_command "get-bucket-location" "client:$1"
   if [[ $# -ne 2 ]]; then
     log 2 "get bucket location command requires command type, bucket name"
     return 1
@@ -26,7 +25,11 @@ get_bucket_location() {
   elif [[ $1 == 's3cmd' ]]; then
     get_bucket_location_s3cmd "$2" || get_result=$?
   elif [[ $1 == 'mc' ]]; then
-    get_bucket_location_mc "$2" || get_result=$?
+    if ! get_bucket_location_mc "$2"; then
+      log 2 "error getting mc bucket location"
+      return 1
+    fi
+    return 0
   else
     log 2 "command type '$1' not implemented for get_bucket_location"
     return 1
@@ -38,7 +41,6 @@ get_bucket_location() {
 }
 
 get_bucket_location_aws() {
-  record_command "get-bucket-location" "client:s3api"
   if [[ $# -ne 1 ]]; then
     log 2 "get bucket location (aws) requires bucket name"
     return 1
@@ -53,32 +55,40 @@ get_bucket_location_aws() {
 }
 
 get_bucket_location_s3cmd() {
-  record_command "get-bucket-location" "client:s3cmd"
   if [[ $# -ne 1 ]]; then
     echo "get bucket location (s3cmd) requires bucket name"
     return 1
   fi
-  info=$(send_command s3cmd --no-check-certificate info "s3://$1") || results=$?
+  info=$(send_command s3cmd "${S3CMD_OPTS[@]}" --no-check-certificate info "s3://$1") || results=$?
   if [[ $results -ne 0 ]]; then
     log 2 "error getting bucket location: $location"
     return 1
   fi
+  log 5 "s3cmd bucket location info: $info"
   bucket_location=$(echo "$info" | grep -o 'Location:.*' | awk '{print $2}')
   return 0
 }
 
 get_bucket_location_mc() {
-  record_command "get-bucket-location" "client:mc"
-  if [[ $# -ne 1 ]]; then
-    log 2 "get bucket location (mc) requires bucket name"
+  if ! check_param_count_v2 "bucket name" 1 $#; then
     return 1
   fi
-  info=$(send_command mc --insecure stat "$MC_ALIAS/$1") || results=$?
-  if [[ $results -ne 0 ]]; then
-    log 2 "error getting s3cmd info: $info"
+  if ! info=$(send_command mc --insecure stat "$MC_ALIAS/$1" 2>&1); then
+    log 2 "error getting mc info: $info"
     return 1
   fi
   # shellcheck disable=SC2034
   bucket_location=$(echo "$info" | grep -o 'Location:.*' | awk '{print $2}')
+  return 0
+}
+
+get_bucket_location_rest() {
+  if ! check_param_count_v2 "bucket, callback" 2 $#; then
+    return 1
+  fi
+  if ! send_rest_go_command_callback "200" "$2" "-bucketName" "$1" "-method" "GET" "-query" "location=" "-awsRegion" "$AWS_REGION"; then
+    log 2 "error sending rest go command"
+    return 1
+  fi
   return 0
 }

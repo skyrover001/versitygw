@@ -25,13 +25,15 @@ import (
 )
 
 var (
-	chownuid, chowngid bool
-	bucketlinks        bool
-	versioningDir      string
-	dirPerms           uint
-	sidecar            string
-	nometa             bool
-	forceNoTmpFile     bool
+	chownuid, chowngid   bool
+	bucketlinks          bool
+	versioningDir        string
+	dirPerms             uint
+	sidecar              string
+	nometa               bool
+	forceNoTmpFile       bool
+	forceNoCopyFileRange bool
+	actionsConcurrency   int
 )
 
 func posixCommand() *cli.Command {
@@ -88,6 +90,13 @@ will be translated into the file /mnt/fs/gwroot/mybucket/a/b/c/myobject`,
 				EnvVars:     []string{"VGW_META_SIDECAR"},
 				Destination: &sidecar,
 			},
+			&cli.IntFlag{
+				Name:        "concurrency",
+				Usage:       "maximum concurrent actions allowed",
+				EnvVars:     []string{"VGW_POSIX_CONCURRENCY"},
+				Value:       5000,
+				Destination: &actionsConcurrency,
+			},
 			&cli.BoolFlag{
 				Name:        "nometa",
 				Usage:       "disable metadata storage",
@@ -99,6 +108,12 @@ will be translated into the file /mnt/fs/gwroot/mybucket/a/b/c/myobject`,
 				Usage:       "disable O_TMPFILE support for new objects",
 				EnvVars:     []string{"VGW_DISABLE_OTMP"},
 				Destination: &forceNoTmpFile,
+			},
+			&cli.BoolFlag{
+				Name:        "disable-copy-file-range",
+				Usage:       "explicitly copy multipart upload parts instead of using copy_file_range (which may hang with some NFS servers)",
+				EnvVars:     []string{"VGW_DISABLE_COPY_FILE_RANGE"},
+				Destination: &forceNoCopyFileRange,
 			},
 		},
 	}
@@ -119,13 +134,20 @@ func runPosix(ctx *cli.Context) error {
 		return fmt.Errorf("cannot use both nometa and sidecar metadata")
 	}
 
+	if actionsConcurrency <= 0 {
+		return fmt.Errorf("concurrency must be positive, got %d", actionsConcurrency)
+	}
+
 	opts := posix.PosixOpts{
-		ChownUID:       chownuid,
-		ChownGID:       chowngid,
-		BucketLinks:    bucketlinks,
-		VersioningDir:  versioningDir,
-		NewDirPerm:     fs.FileMode(dirPerms),
-		ForceNoTmpFile: forceNoTmpFile,
+		ChownUID:             chownuid,
+		ChownGID:             chowngid,
+		BucketLinks:          bucketlinks,
+		VersioningDir:        versioningDir,
+		NewDirPerm:           fs.FileMode(dirPerms),
+		ForceNoTmpFile:       forceNoTmpFile,
+		ForceNoCopyFileRange: forceNoCopyFileRange,
+		ValidateBucketNames:  disableStrictBucketNames,
+		Concurrency:          actionsConcurrency,
 	}
 
 	var ms meta.MetadataStorer

@@ -132,6 +132,7 @@ func (ipa *IpaIAMService) GetUserAccount(access string) (Account, error) {
 	userResult := struct {
 		Gidnumber []string
 		Uidnumber []string
+		PidNumber []string
 	}{}
 
 	err = ipa.rpc(req, &userResult)
@@ -139,20 +140,25 @@ func (ipa *IpaIAMService) GetUserAccount(access string) (Account, error) {
 		return Account{}, err
 	}
 
-	uid, err := strconv.Atoi(userResult.Uidnumber[0])
+	uid, err := parseToInt(userResult.Uidnumber, "userID")
 	if err != nil {
-		return Account{}, fmt.Errorf("ipa uid invalid: %w", err)
+		return Account{}, err
 	}
-	gid, err := strconv.Atoi(userResult.Gidnumber[0])
+	gid, err := parseToInt(userResult.Gidnumber, "groupID")
 	if err != nil {
-		return Account{}, fmt.Errorf("ipa gid invalid: %w", err)
+		return Account{}, err
+	}
+	pId, err := parseToInt(userResult.PidNumber, "projectID")
+	if err != nil {
+		return Account{}, err
 	}
 
 	account := Account{
-		Access:  access,
-		Role:    RoleUser,
-		UserID:  uid,
-		GroupID: gid,
+		Access:    access,
+		Role:      RoleUser,
+		UserID:    uid,
+		GroupID:   gid,
+		ProjectID: pId,
 	}
 
 	session_key := make([]byte, 16)
@@ -410,7 +416,7 @@ func (ipa *IpaIAMService) newRequest(method string, args []string, dict map[stri
 		return "", fmt.Errorf("ipa request invalid: %w", err)
 	}
 
-	request := map[string]interface{}{
+	request := map[string]any{
 		"id":     id,
 		"method": json.RawMessage(jmethod),
 		"params": []json.RawMessage{json.RawMessage(jargs), json.RawMessage(jdict)},
@@ -442,7 +448,7 @@ func pkcs7Unpad(b []byte, blocksize int) ([]byte, error) {
 	if n == 0 || n > len(b) {
 		return nil, errors.New("invalid padding on input")
 	}
-	for i := 0; i < n; i++ {
+	for i := range n {
 		if b[len(b)-n+i] != c {
 			return nil, errors.New("invalid padding on input")
 		}
@@ -493,4 +499,21 @@ func (b *Base64Encoded) UnmarshalJSON(data []byte) error {
 	}
 	*b, err = base64.StdEncoding.DecodeString(intermediate)
 	return err
+}
+
+// parseToInt parses the first argument of input string slice
+// to an integer. If slice is empty, it defaults to 0
+func parseToInt(input []string, argName string) (int, error) {
+	if len(input) == 0 {
+		debuglogger.IAMLogf("empty %s slice: defaulting to 0", argName)
+		return 0, nil
+	}
+
+	id, err := strconv.Atoi(input[0])
+	if err != nil {
+		debuglogger.IAMLogf("failed to parse %s: %v", argName, err)
+		return 0, fmt.Errorf("invalid %s: %w", argName, err)
+	}
+
+	return id, nil
 }

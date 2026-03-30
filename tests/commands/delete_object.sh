@@ -17,7 +17,6 @@
 # params:  client, bucket, key
 delete_object() {
   log 6 "delete_object"
-  record_command "delete-object" "client:$1"
   if ! check_param_count "delete_object" "command type, bucket, key" 3 $#; then
     return 1
   fi
@@ -85,6 +84,17 @@ delete_object_version_rest() {
   return 0
 }
 
+delete_object_version_rest_expect_error() {
+  if ! check_param_count_v2 "bucket name, object name, version ID, expected code, expected error, expected message" 6 $#; then
+    return 1
+  fi
+  if ! send_rest_command_expect_error "BUCKET_NAME=$1 OBJECT_KEY=$2 VERSION_ID=$3" "./tests/rest_scripts/delete_object.sh" "$4" "$5" "$6"; then
+    log 2 "error deleting object: $result"
+    return 1
+  fi
+  return 0
+}
+
 delete_object_version_bypass_retention() {
   if ! check_param_count "delete_object_version_bypass_retention" "bucket, key, version ID" 3 $#; then
     return 1
@@ -113,7 +123,6 @@ delete_object_version_rest_bypass_retention() {
 }
 
 delete_object_with_user() {
-  record_command "delete-object" "client:$1"
   if ! check_param_count "delete_object_version_bypass_retention" "command type, bucket, key, access ID, secret key" 5 $#; then
     return 1
   fi
@@ -130,6 +139,7 @@ delete_object_with_user() {
   fi
   if [ $exit_code -ne 0 ]; then
     log 2 "error deleting object: $delete_object_error"
+    echo "$delete_object_error" >&2
     return 1
   fi
   return 0

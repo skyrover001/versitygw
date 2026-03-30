@@ -21,9 +21,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/gofiber/fiber/v2"
 	"github.com/versity/versitygw/auth"
-	"github.com/versity/versitygw/debuglogger"
 	"github.com/versity/versitygw/s3api/utils"
-	"github.com/versity/versitygw/s3err"
 	"github.com/versity/versitygw/s3response"
 )
 
@@ -43,6 +41,7 @@ func (c S3ApiController) GetBucketTagging(ctx *fiber.Ctx) (*Response, error) {
 		Bucket:          bucket,
 		Action:          auth.GetBucketTaggingAction,
 		IsPublicRequest: isPublicBucket,
+		DisableACL:      c.disableACL,
 	})
 	if err != nil {
 		return &Response{
@@ -95,6 +94,7 @@ func (c S3ApiController) GetBucketOwnershipControls(ctx *fiber.Ctx) (*Response, 
 		Bucket:          bucket,
 		Action:          auth.GetBucketOwnershipControlsAction,
 		IsPublicRequest: isPublicBucket,
+		DisableACL:      c.disableACL,
 	})
 	if err != nil {
 		return &Response{
@@ -135,6 +135,7 @@ func (c S3ApiController) GetBucketVersioning(ctx *fiber.Ctx) (*Response, error) 
 		Bucket:          bucket,
 		Action:          auth.GetBucketVersioningAction,
 		IsPublicRequest: isPublicBucket,
+		DisableACL:      c.disableACL,
 	})
 	if err != nil {
 		return &Response{
@@ -177,6 +178,7 @@ func (c S3ApiController) GetBucketCors(ctx *fiber.Ctx) (*Response, error) {
 		Bucket:          bucket,
 		Action:          auth.GetBucketCorsAction,
 		IsPublicRequest: isPublicBucket,
+		DisableACL:      c.disableACL,
 	})
 	if err != nil {
 		return &Response{
@@ -220,6 +222,7 @@ func (c S3ApiController) GetBucketPolicy(ctx *fiber.Ctx) (*Response, error) {
 		Bucket:          bucket,
 		Action:          auth.GetBucketPolicyAction,
 		IsPublicRequest: isPublicBucket,
+		DisableACL:      c.disableACL,
 	})
 	if err != nil {
 		return &Response{
@@ -254,6 +257,7 @@ func (c S3ApiController) GetBucketPolicyStatus(ctx *fiber.Ctx) (*Response, error
 		Bucket:          bucket,
 		Action:          auth.GetBucketPolicyStatusAction,
 		IsPublicRequest: isPublicBucket,
+		DisableACL:      c.disableACL,
 	})
 	if err != nil {
 		return &Response{
@@ -315,6 +319,7 @@ func (c S3ApiController) ListObjectVersions(ctx *fiber.Ctx) (*Response, error) {
 		Bucket:          bucket,
 		Action:          auth.ListBucketVersionsAction,
 		IsPublicRequest: isPublicBucket,
+		DisableACL:      c.disableACL,
 	})
 	if err != nil {
 		return &Response{
@@ -324,15 +329,13 @@ func (c S3ApiController) ListObjectVersions(ctx *fiber.Ctx) (*Response, error) {
 		}, err
 	}
 
-	maxkeys, err := utils.ParseUint(maxkeysStr)
+	maxkeys, err := utils.ParseMaxLimiter(maxkeysStr, utils.LimiterTypeVersionsMaxKeys)
 	if err != nil {
-		debuglogger.Logf("error parsing max keys %q: %v",
-			maxkeysStr, err)
 		return &Response{
 			MetaOpts: &MetaOptions{
 				BucketOwner: parsedAcl.Owner,
 			},
-		}, s3err.GetAPIError(s3err.ErrInvalidMaxKeys)
+		}, err
 	}
 
 	data, err := c.be.ListObjectVersions(ctx.Context(),
@@ -370,6 +373,7 @@ func (c S3ApiController) GetObjectLockConfiguration(ctx *fiber.Ctx) (*Response, 
 		Bucket:          bucket,
 		Action:          auth.GetBucketObjectLockConfigurationAction,
 		IsPublicRequest: isPublicBucket,
+		DisableACL:      c.disableACL,
 	})
 	if err != nil {
 		return &Response{
@@ -415,6 +419,7 @@ func (c S3ApiController) GetBucketAcl(ctx *fiber.Ctx) (*Response, error) {
 		Bucket:          bucket,
 		Action:          auth.GetBucketAclAction,
 		IsPublicRequest: isPublicBucket,
+		DisableACL:      c.disableACL,
 	})
 	if err != nil {
 		return &Response{
@@ -466,6 +471,7 @@ func (c S3ApiController) ListMultipartUploads(ctx *fiber.Ctx) (*Response, error)
 		Bucket:          bucket,
 		Action:          auth.ListBucketMultipartUploadsAction,
 		IsPublicRequest: isPublicBucket,
+		DisableACL:      c.disableACL,
 	})
 	if err != nil {
 		return &Response{
@@ -474,15 +480,13 @@ func (c S3ApiController) ListMultipartUploads(ctx *fiber.Ctx) (*Response, error)
 			},
 		}, err
 	}
-	maxUploads, err := utils.ParseUint(maxUploadsStr)
+	maxUploads, err := utils.ParseMaxLimiter(maxUploadsStr, utils.LimiterTypeMaxUploads)
 	if err != nil {
-		debuglogger.Logf("error parsing max uploads %q: %v",
-			maxUploadsStr, err)
 		return &Response{
 			MetaOpts: &MetaOptions{
 				BucketOwner: parsedAcl.Owner,
 			},
-		}, s3err.GetAPIError(s3err.ErrInvalidMaxUploads)
+		}, err
 	}
 	res, err := c.be.ListMultipartUploads(ctx.Context(),
 		&s3.ListMultipartUploadsInput{
@@ -525,6 +529,7 @@ func (c S3ApiController) ListObjectsV2(ctx *fiber.Ctx) (*Response, error) {
 		Bucket:          bucket,
 		Action:          auth.ListBucketAction,
 		IsPublicRequest: isPublicBucket,
+		DisableACL:      c.disableACL,
 	})
 	if err != nil {
 		return &Response{
@@ -533,15 +538,13 @@ func (c S3ApiController) ListObjectsV2(ctx *fiber.Ctx) (*Response, error) {
 			},
 		}, err
 	}
-	maxkeys, err := utils.ParseUint(maxkeysStr)
+	maxkeys, err := utils.ParseMaxLimiter(maxkeysStr, utils.LimiterTypeMaxKeys)
 	if err != nil {
-		debuglogger.Logf("error parsing max keys %q: %v",
-			maxkeysStr, err)
 		return &Response{
 			MetaOpts: &MetaOptions{
 				BucketOwner: parsedAcl.Owner,
 			},
-		}, s3err.GetAPIError(s3err.ErrInvalidMaxKeys)
+		}, err
 	}
 
 	res, err := c.be.ListObjectsV2(ctx.Context(),
@@ -584,6 +587,7 @@ func (c S3ApiController) ListObjects(ctx *fiber.Ctx) (*Response, error) {
 		Bucket:          bucket,
 		Action:          auth.ListBucketAction,
 		IsPublicRequest: isPublicBucket,
+		DisableACL:      c.disableACL,
 	})
 	if err != nil {
 		return &Response{
@@ -593,15 +597,13 @@ func (c S3ApiController) ListObjects(ctx *fiber.Ctx) (*Response, error) {
 		}, err
 	}
 
-	maxkeys, err := utils.ParseUint(maxkeysStr)
+	maxkeys, err := utils.ParseMaxLimiter(maxkeysStr, utils.LimiterTypeMaxKeys)
 	if err != nil {
-		debuglogger.Logf("error parsing max keys %q: %v",
-			maxkeysStr, err)
 		return &Response{
 			MetaOpts: &MetaOptions{
 				BucketOwner: parsedAcl.Owner,
 			},
-		}, s3err.GetAPIError(s3err.ErrInvalidMaxKeys)
+		}, err
 	}
 
 	res, err := c.be.ListObjects(ctx.Context(),
@@ -637,6 +639,7 @@ func (c S3ApiController) GetBucketLocation(ctx *fiber.Ctx) (*Response, error) {
 		Bucket:          bucket,
 		Action:          auth.GetBucketLocationAction,
 		IsPublicRequest: isPublicBucket,
+		DisableACL:      c.disableACL,
 	})
 	if err != nil {
 		return &Response{
@@ -658,10 +661,14 @@ func (c S3ApiController) GetBucketLocation(ctx *fiber.Ctx) (*Response, error) {
 
 	// pick up configured region from locals (set by router middleware)
 	region, _ := ctx.Locals("region").(string)
+	value := &region
+	if region == "us-east-1" {
+		value = nil
+	}
 
 	return &Response{
 		Data: s3response.LocationConstraint{
-			Value: region,
+			Value: value,
 		},
 		MetaOpts: &MetaOptions{
 			BucketOwner: parsedAcl.Owner,

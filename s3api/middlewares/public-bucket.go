@@ -15,6 +15,8 @@
 package middlewares
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"io"
 	"strings"
 
@@ -28,10 +30,10 @@ import (
 
 // AuthorizePublicBucketAccess checks if the bucket grants public
 // access to anonymous requesters
-func AuthorizePublicBucketAccess(be backend.Backend, s3action string, policyPermission auth.Action, permission auth.Permission) fiber.Handler {
+func AuthorizePublicBucketAccess(be backend.Backend, s3action string, policyPermission auth.Action, permission auth.Permission, region string, streamBody bool) fiber.Handler {
 	return func(ctx *fiber.Ctx) error {
 		// skip for authenticated requests
-		if ctx.Query("X-Amz-Algorithm") != "" || ctx.Get("Authorization") != "" {
+		if utils.IsPresignedURLAuth(ctx) || ctx.Get("Authorization") != "" {
 			return nil
 		}
 
@@ -57,12 +59,31 @@ func AuthorizePublicBucketAccess(be backend.Backend, s3action string, policyPerm
 		bucket, object := parsePath(ctx.Path())
 		err := auth.VerifyPublicAccess(ctx.Context(), be, policyPermission, permission, bucket, object)
 		if err != nil {
+			if s3action == metrics.ActionHeadBucket {
+				// add the bucket region header for HeadBucket
+				// if anonymous access is denied
+				ctx.Response().Header.Add("x-amz-bucket-region", region)
+			}
 			return err
 		}
 
-		if utils.IsBigDataAction(ctx) {
-			payloadType := ctx.Get("X-Amz-Content-Sha256")
-			if utils.IsUnsignedStreamingPayload(payloadType) {
+		// at this point the bucket is considered as public
+		// as public access is granted
+		utils.ContextKeyPublicBucket.Set(ctx, true)
+
+		payloadHash := ctx.Get("X-Amz-Content-Sha256")
+		err = utils.IsAnonymousPayloadHashSupported(payloadHash)
+		if err != nil {
+			return err
+		}
+
+		if streamBody {
+			if utils.IsUnsignedStreamingPayload(payloadHash) {
+				cLength, err := utils.ParseDecodedContentLength(ctx)
+				if err != nil {
+					return err
+				}
+				// stack an unsigned streaming payload reader
 				checksumType, err := utils.ExtractChecksumType(ctx)
 				if err != nil {
 					return err
@@ -70,19 +91,37 @@ func AuthorizePublicBucketAccess(be backend.Backend, s3action string, policyPerm
 
 				wrapBodyReader(ctx, func(r io.Reader) io.Reader {
 					var cr io.Reader
-					cr, err = utils.NewUnsignedChunkReader(r, checksumType)
+					cr, err = utils.NewUnsignedChunkReader(r, checksumType, cLength)
 					return cr
 				})
-				if err != nil {
-					return err
-				}
-			} else {
-				utils.ContextKeyBodyReader.Set(ctx, ctx.Request().BodyStream())
-			}
 
+				return err
+			} else if utils.IsUnsignedPaylod(payloadHash) {
+				// for UNSIGNED-PAYLOD simply store the body reader in context locals
+				utils.ContextKeyBodyReader.Set(ctx, ctx.Request().BodyStream())
+				return nil
+			} else {
+				// stack a hash reader to calculated the payload sha256 hash
+				wrapBodyReader(ctx, func(r io.Reader) io.Reader {
+					var cr io.Reader
+					cr, err = utils.NewHashReader(r, payloadHash, utils.HashTypeSha256Hex)
+					return cr
+				})
+
+				return err
+			}
 		}
 
-		utils.ContextKeyPublicBucket.Set(ctx, true)
+		if payloadHash != "" {
+			// Calculate the hash of the request payload
+			hashedPayload := sha256.Sum256(ctx.Body())
+			hexPayload := hex.EncodeToString(hashedPayload[:])
+
+			// Compare the calculated hash with the hash provided
+			if payloadHash != hexPayload {
+				return s3err.GetAPIError(s3err.ErrContentSHA256Mismatch)
+			}
+		}
 
 		return nil
 	}

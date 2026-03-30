@@ -17,7 +17,6 @@
 source ./tests/drivers/params.sh
 
 get_object_lock_configuration() {
-  record_command "get-object-lock-configuration" "client:s3api"
   if ! check_param_count "get_object_lock_configuration" "client, bucket name" 2 $#; then
     return 1
   fi
@@ -53,5 +52,6 @@ get_object_lock_configuration_rest() {
     return 1
   fi
   lock_config="$(cat "$TEST_FILE_FOLDER/object-lock-config.txt")"
+  log 5 "lock config: $lock_config"
   return 0
 }

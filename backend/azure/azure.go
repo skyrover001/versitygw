@@ -25,8 +25,10 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -68,6 +70,9 @@ const (
 	onameAttr              key = "Objname"
 	onameAttrLower         key = "objname"
 	metaTmpMultipartPrefix key = ".sgwtmp" + "/multipart"
+	// keyMpZeroBytesParts tracks zero-byte upload parts in the sgwtmp metadata.
+	// Azure StageBlock rejects Content-Length: 0, so zero-byte parts are stored here.
+	keyMpZeroBytesParts key = "Zerobytesparts"
 
 	defaultListingMaxKeys = 1000
 )
@@ -157,7 +162,7 @@ func (az *Azure) CreateBucket(ctx context.Context, input *s3.CreateBucketInput, 
 		string(keyOwnership):  backend.GetPtrFromString(encodeBytes([]byte(input.ObjectOwnership))),
 	}
 
-	acct, ok := ctx.Value("account").(auth.Account)
+	acct, ok := ctx.Value("bucket-owner").(auth.Account)
 	if !ok {
 		acct = auth.Account{}
 	}
@@ -177,7 +182,21 @@ func (az *Azure) CreateBucket(ctx context.Context, input *s3.CreateBucketInput, 
 		meta[string(keyBucketLock)] = backend.GetPtrFromString(encodeBytes(defaultLockParsed))
 	}
 
-	_, err := az.client.CreateContainer(ctx, *input.Bucket, &container.CreateOptions{Metadata: meta})
+	tagging, err := backend.ParseCreateBucketTags(input.CreateBucketConfiguration.Tags)
+	if err != nil {
+		return err
+	}
+
+	if tagging != nil {
+		tags, err := json.Marshal(tagging)
+		if err != nil {
+			return fmt.Errorf("marshal tags: %w", err)
+		}
+
+		meta[string(keyTags)] = backend.GetPtrFromString(encodeBytes(tags))
+	}
+
+	_, err = az.client.CreateContainer(ctx, *input.Bucket, &container.CreateOptions{Metadata: meta})
 	if errors.Is(s3err.GetAPIError(s3err.ErrBucketAlreadyExists), azureErrToS3Err(err)) {
 		aclBytes, err := az.getContainerMetaData(ctx, *input.Bucket, string(keyAclCapital))
 		if err != nil {
@@ -198,54 +217,61 @@ func (az *Azure) CreateBucket(ctx context.Context, input *s3.CreateBucketInput, 
 }
 
 func (az *Azure) ListBuckets(ctx context.Context, input s3response.ListBucketsInput) (s3response.ListAllMyBucketsResult, error) {
-	pager := az.client.NewListContainersPager(
-		&service.ListContainersOptions{
-			Include: service.ListContainersInclude{
-				Metadata: true,
-			},
-			Marker:     &input.ContinuationToken,
-			MaxResults: &input.MaxBuckets,
-			Prefix:     &input.Prefix,
-		})
+	opts := &service.ListContainersOptions{
+		Include: service.ListContainersInclude{
+			Metadata: true,
+		},
+		Prefix: &input.Prefix,
+	}
+	pager := az.client.NewListContainersPager(opts)
 
 	var buckets []s3response.ListAllMyBucketsEntry
+	var cToken string
 	result := s3response.ListAllMyBucketsResult{
 		Prefix: input.Prefix,
 	}
 
-	resp, err := pager.NextPage(ctx)
-	if err != nil {
-		return result, azureErrToS3Err(err)
-	}
-	for _, v := range resp.ContainerItems {
-		if input.IsAdmin {
-			buckets = append(buckets, s3response.ListAllMyBucketsEntry{
-				Name: *v.Name,
-				// TODO: using modification date here instead of creation, is that ok?
-				CreationDate: *v.Properties.LastModified,
-			})
-		} else {
-			acl, err := getAclFromMetadata(v.Metadata, keyAclLower)
-			if err != nil {
-				return result, err
+outer:
+	for pager.More() {
+		resp, err := pager.NextPage(ctx)
+		if err != nil {
+			return result, azureErrToS3Err(err)
+		}
+		for _, v := range resp.ContainerItems {
+			// If we've already filled MaxBuckets, there is a next page — set token and stop
+			if input.MaxBuckets > 0 && int32(len(buckets)) == input.MaxBuckets {
+				cToken = buckets[len(buckets)-1].Name
+				break outer
 			}
-
-			if acl.Owner == input.Owner {
+			// Skip items at or before the continuation token (client-side "start after")
+			if input.ContinuationToken != "" && *v.Name <= input.ContinuationToken {
+				continue
+			}
+			if input.IsAdmin {
 				buckets = append(buckets, s3response.ListAllMyBucketsEntry{
 					Name: *v.Name,
 					// TODO: using modification date here instead of creation, is that ok?
 					CreationDate: *v.Properties.LastModified,
 				})
+			} else {
+				acl, err := getAclFromMetadata(v.Metadata, keyAclLower)
+				if err != nil {
+					return result, err
+				}
+				if acl.Owner == input.Owner {
+					buckets = append(buckets, s3response.ListAllMyBucketsEntry{
+						Name: *v.Name,
+						// TODO: using modification date here instead of creation, is that ok?
+						CreationDate: *v.Properties.LastModified,
+					})
+				}
 			}
 		}
 	}
 
-	if resp.NextMarker != nil {
-		result.ContinuationToken = *resp.NextMarker
-	}
-
 	result.Buckets.Bucket = buckets
 	result.Owner.ID = input.Owner
+	result.ContinuationToken = cToken
 
 	return result, nil
 }
@@ -337,10 +363,6 @@ func (az *Azure) PutObject(ctx context.Context, po s3response.PutObjectInput) (s
 		opts.HTTPHeaders.BlobContentType = po.ContentType
 	}
 
-	if opts.HTTPHeaders.BlobContentType == nil {
-		opts.HTTPHeaders.BlobContentType = backend.GetPtrFromString(backend.DefaultContentType)
-	}
-
 	uploadResp, err := az.client.UploadStream(ctx, *po.Bucket, *po.Key, po.Body, opts)
 	if err != nil {
 		return s3response.PutObjectOutput{}, azureErrToS3Err(err)
@@ -350,6 +372,9 @@ func (az *Azure) PutObject(ctx context.Context, po s3response.PutObjectInput) (s
 	if po.ObjectLockLegalHoldStatus == types.ObjectLockLegalHoldStatusOn {
 		err := az.PutObjectLegalHold(ctx, *po.Bucket, *po.Key, "", true)
 		if err != nil {
+			if errors.Is(err, s3err.GetAPIError(s3err.ErrMissingObjectLockConfiguration)) {
+				err = s3err.GetAPIError(s3err.ErrMissingObjectLockConfigurationNoSpaces)
+			}
 			return s3response.PutObjectOutput{}, err
 		}
 	}
@@ -364,8 +389,11 @@ func (az *Azure) PutObject(ctx context.Context, po s3response.PutObjectInput) (s
 		if err != nil {
 			return s3response.PutObjectOutput{}, fmt.Errorf("parse object lock retention: %w", err)
 		}
-		err = az.PutObjectRetention(ctx, *po.Bucket, *po.Key, "", true, retParsed)
+		err = az.PutObjectRetention(ctx, *po.Bucket, *po.Key, "", retParsed)
 		if err != nil {
+			if errors.Is(err, s3err.GetAPIError(s3err.ErrMissingObjectLockConfiguration)) {
+				err = s3err.GetAPIError(s3err.ErrMissingObjectLockConfigurationNoSpaces)
+			}
 			return s3response.PutObjectOutput{}, err
 		}
 	}
@@ -466,16 +494,11 @@ func (az *Azure) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.G
 		tagcount = int32(*blobDownloadResponse.TagCount)
 	}
 
-	contentType := blobDownloadResponse.ContentType
-	if contentType == nil {
-		contentType = backend.GetPtrFromString(backend.DefaultContentType)
-	}
-
 	return &s3.GetObjectOutput{
 		AcceptRanges:       backend.GetPtrFromString("bytes"),
 		ContentLength:      blobDownloadResponse.ContentLength,
 		ContentEncoding:    blobDownloadResponse.ContentEncoding,
-		ContentType:        contentType,
+		ContentType:        blobDownloadResponse.ContentType,
 		ContentDisposition: blobDownloadResponse.ContentDisposition,
 		ContentLanguage:    blobDownloadResponse.ContentLanguage,
 		CacheControl:       blobDownloadResponse.CacheControl,
@@ -563,10 +586,16 @@ func (az *Azure) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s3
 	retention, ok := resp.Metadata[string(keyObjRetention)]
 	if ok {
 		var config types.ObjectLockRetention
-		if err := json.Unmarshal([]byte(*retention), &config); err == nil {
+		err := json.Unmarshal([]byte(*retention), &config)
+		if err == nil {
 			result.ObjectLockMode = types.ObjectLockMode(config.Mode)
 			result.ObjectLockRetainUntilDate = config.RetainUntilDate
 		}
+	}
+
+	if resp.TagCount != nil {
+		tagcount := int32(*resp.TagCount)
+		result.TagCount = &tagcount
 	}
 
 	return result, nil
@@ -925,7 +954,7 @@ func (az *Azure) CopyObject(ctx context.Context, input s3response.CopyObjectInpu
 		}
 	}
 
-	if strings.Join([]string{*input.Bucket, *input.Key}, "/") == *input.CopySource {
+	if srcBucket == *input.Bucket && srcObj == *input.Key {
 		if input.MetadataDirective != types.MetadataDirectiveReplace {
 			return s3response.CopyObjectOutput{}, s3err.GetAPIError(s3err.ErrInvalidCopyDest)
 		}
@@ -961,6 +990,9 @@ func (az *Azure) CopyObject(ctx context.Context, input s3response.CopyObjectInpu
 		if input.ObjectLockLegalHoldStatus != "" {
 			err = az.PutObjectLegalHold(ctx, *input.Bucket, *input.Key, "", input.ObjectLockLegalHoldStatus == types.ObjectLockLegalHoldStatusOn)
 			if err != nil {
+				if errors.Is(err, s3err.GetAPIError(s3err.ErrMissingObjectLockConfiguration)) {
+					err = s3err.GetAPIError(s3err.ErrMissingObjectLockConfigurationNoSpaces)
+				}
 				return s3response.CopyObjectOutput{}, azureErrToS3Err(err)
 			}
 		}
@@ -977,8 +1009,11 @@ func (az *Azure) CopyObject(ctx context.Context, input s3response.CopyObjectInpu
 			if err != nil {
 				return s3response.CopyObjectOutput{}, fmt.Errorf("parse object retention: %w", err)
 			}
-			err = az.PutObjectRetention(ctx, *input.Bucket, *input.Key, "", true, retParsed)
+			err = az.PutObjectRetention(ctx, *input.Bucket, *input.Key, "", retParsed)
 			if err != nil {
+				if errors.Is(err, s3err.GetAPIError(s3err.ErrMissingObjectLockConfiguration)) {
+					err = s3err.GetAPIError(s3err.ErrMissingObjectLockConfigurationNoSpaces)
+				}
 				return s3response.CopyObjectOutput{}, azureErrToS3Err(err)
 			}
 		}
@@ -1008,6 +1043,7 @@ func (az *Azure) CopyObject(ctx context.Context, input s3response.CopyObjectInpu
 	if err != nil {
 		return s3response.CopyObjectOutput{}, azureErrToS3Err(err)
 	}
+	defer downloadResp.Body.Close()
 
 	pInput := s3response.PutObjectInput{
 		Body:                      downloadResp.Body,
@@ -1071,7 +1107,7 @@ func (az *Azure) CopyObject(ctx context.Context, input s3response.CopyObjectInpu
 	}, nil
 }
 
-func (az *Azure) PutObjectTagging(ctx context.Context, bucket, object string, tags map[string]string) error {
+func (az *Azure) PutObjectTagging(ctx context.Context, bucket, object, _ string, tags map[string]string) error {
 	client, err := az.getBlobClient(bucket, object)
 	if err != nil {
 		return err
@@ -1085,7 +1121,7 @@ func (az *Azure) PutObjectTagging(ctx context.Context, bucket, object string, ta
 	return nil
 }
 
-func (az *Azure) GetObjectTagging(ctx context.Context, bucket, object string) (map[string]string, error) {
+func (az *Azure) GetObjectTagging(ctx context.Context, bucket, object, _ string) (map[string]string, error) {
 	client, err := az.getBlobClient(bucket, object)
 	if err != nil {
 		return nil, err
@@ -1099,7 +1135,7 @@ func (az *Azure) GetObjectTagging(ctx context.Context, bucket, object string) (m
 	return parseAzTags(tags.BlobTagSet), nil
 }
 
-func (az *Azure) DeleteObjectTagging(ctx context.Context, bucket, object string) error {
+func (az *Azure) DeleteObjectTagging(ctx context.Context, bucket, object, _ string) error {
 	client, err := az.getBlobClient(bucket, object)
 	if err != nil {
 		return err
@@ -1121,16 +1157,20 @@ func (az *Azure) CreateMultipartUpload(ctx context.Context, input s3response.Cre
 		}
 
 		if len(bucketLock) == 0 {
-			return s3response.InitiateMultipartUploadResult{}, s3err.GetAPIError(s3err.ErrInvalidBucketObjectLockConfiguration)
+			return s3response.InitiateMultipartUploadResult{},
+				s3err.GetAPIError(s3err.ErrMissingObjectLockConfigurationNoSpaces)
 		}
 
 		var bucketLockConfig auth.BucketLockConfig
-		if err := json.Unmarshal(bucketLock, &bucketLockConfig); err != nil {
-			return s3response.InitiateMultipartUploadResult{}, fmt.Errorf("parse bucket lock config: %w", err)
+		err = json.Unmarshal(bucketLock, &bucketLockConfig)
+		if err != nil {
+			return s3response.InitiateMultipartUploadResult{},
+				fmt.Errorf("parse bucket lock config: %w", err)
 		}
 
 		if !bucketLockConfig.Enabled {
-			return s3response.InitiateMultipartUploadResult{}, s3err.GetAPIError(s3err.ErrInvalidBucketObjectLockConfiguration)
+			return s3response.InitiateMultipartUploadResult{},
+				s3err.GetAPIError(s3err.ErrMissingObjectLockConfigurationNoSpaces)
 		}
 	}
 
@@ -1198,7 +1238,8 @@ func (az *Azure) CreateMultipartUpload(ctx context.Context, input s3response.Cre
 
 // Each part is translated into an uncommitted block in a newly created blob in staging area
 func (az *Azure) UploadPart(ctx context.Context, input *s3.UploadPartInput) (*s3.UploadPartOutput, error) {
-	if err := az.checkIfMpExists(ctx, *input.Bucket, *input.Key, *input.UploadId); err != nil {
+	err := az.checkIfMpExists(ctx, *input.Bucket, *input.Key, *input.UploadId)
+	if err != nil {
 		return nil, err
 	}
 
@@ -1211,13 +1252,31 @@ func (az *Azure) UploadPart(ctx context.Context, input *s3.UploadPartInput) (*s3
 		return nil, err
 	}
 
+	// block id serves as etag here
+	etag := blockIDInt32ToBase64(*input.PartNumber)
+
+	// Azure StageBlock rejects Content-Length: 0 as an invalid header value.
+	// Track zero-byte parts in the sgwtmp metadata instead of staging them.
+	size, err := rdr.Seek(0, io.SeekEnd)
+	if err != nil {
+		return nil, err
+	}
+	if _, err = rdr.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+	if size == 0 {
+		err := az.trackZeroBytePart(ctx, *input.Bucket, *input.Key, *input.UploadId, *input.PartNumber)
+		if err != nil {
+			return nil, err
+		}
+		return &s3.UploadPartOutput{ETag: &etag}, nil
+	}
+
 	client, err := az.getBlockBlobClient(*input.Bucket, *input.Key)
 	if err != nil {
 		return nil, err
 	}
 
-	// block id serves as etag here
-	etag := blockIDInt32ToBase64(*input.PartNumber)
 	_, err = client.StageBlock(ctx, etag, rdr, nil)
 	if err != nil {
 		return nil, parseMpError(err)
@@ -1234,7 +1293,8 @@ func (az *Azure) UploadPartCopy(ctx context.Context, input *s3.UploadPartCopyInp
 		return s3response.CopyPartResult{}, err
 	}
 
-	if err := az.checkIfMpExists(ctx, *input.Bucket, *input.Key, *input.UploadId); err != nil {
+	err = az.checkIfMpExists(ctx, *input.Bucket, *input.Key, *input.UploadId)
+	if err != nil {
 		return s3response.CopyPartResult{}, err
 	}
 
@@ -1251,7 +1311,8 @@ func (az *Azure) UploadPartCopy(ctx context.Context, input *s3.UploadPartCopyInp
 
 // Lists all uncommitted parts from the blob
 func (az *Azure) ListParts(ctx context.Context, input *s3.ListPartsInput) (s3response.ListPartsResult, error) {
-	if err := az.checkIfMpExists(ctx, *input.Bucket, *input.Key, *input.UploadId); err != nil {
+	err := az.checkIfMpExists(ctx, *input.Bucket, *input.Key, *input.UploadId)
+	if err != nil {
 		return s3response.ListPartsResult{}, err
 	}
 	client, err := az.getBlockBlobClient(*input.Bucket, *input.Key)
@@ -1267,49 +1328,66 @@ func (az *Azure) ListParts(ctx context.Context, input *s3.ListPartsInput) (s3res
 	if *input.PartNumberMarker != "" {
 		partNumberMarker, err = strconv.Atoi(*input.PartNumberMarker)
 		if err != nil {
-			return s3response.ListPartsResult{}, s3err.GetAPIError(s3err.ErrInvalidPartNumberMarker)
+			return s3response.ListPartsResult{},
+				s3err.GetInvalidMaxLimiterErr("part-number-marker")
 		}
 	}
 	if input.MaxParts != nil {
 		maxParts = *input.MaxParts
 	}
 
-	resp, err := client.GetBlockList(ctx, blockblob.BlockListTypeUncommitted, nil)
-	if err != nil {
-		// If the mp exists but the client returns 'NoSuchKey' error, return empty result
-		if errors.Is(azureErrToS3Err(err), s3err.GetAPIError(s3err.ErrNoSuchKey)) {
-			return s3response.ListPartsResult{
-				Bucket:           *input.Bucket,
-				Key:              *input.Key,
-				PartNumberMarker: partNumberMarker,
-				IsTruncated:      isTruncated,
-				MaxParts:         int(maxParts),
-				StorageClass:     types.StorageClassStandard,
-			}, nil
+	resp, blockListErr := client.GetBlockList(ctx, blockblob.BlockListTypeUncommitted, nil)
+	if blockListErr != nil {
+		if !errors.Is(azureErrToS3Err(blockListErr), s3err.GetAPIError(s3err.ErrNoSuchKey)) {
+			return s3response.ListPartsResult{}, blockListErr
 		}
+		// NoSuchKey means no blocks have been staged yet (possible if only zero-byte
+		// parts exist). Continue so we can still return those from metadata.
 	}
 
 	parts := []s3response.Part{}
-	for _, el := range resp.UncommittedBlocks {
-		partNumber, err := decodeBlockId(*el.Name)
-		if err != nil {
-			return s3response.ListPartsResult{}, err
+	if blockListErr == nil {
+		for _, el := range resp.UncommittedBlocks {
+			partNumber, err := decodeBlockId(*el.Name)
+			if err != nil {
+				return s3response.ListPartsResult{}, err
+			}
+			if partNumberMarker >= partNumber {
+				continue
+			}
+			parts = append(parts, s3response.Part{
+				Size:         *el.Size,
+				ETag:         *el.Name,
+				PartNumber:   partNumber,
+				LastModified: time.Now(),
+			})
 		}
-		if partNumberMarker >= partNumber {
+	}
+
+	// Merge in zero-byte parts tracked in the sgwtmp metadata.
+	zbParts, _ := az.getZeroByteParts(ctx, *input.Bucket, *input.Key, *input.UploadId)
+	for _, zbPartNum := range zbParts {
+		if partNumberMarker >= int(zbPartNum) {
 			continue
 		}
 		parts = append(parts, s3response.Part{
-			Size:         *el.Size,
-			ETag:         *el.Name,
-			PartNumber:   partNumber,
+			Size:         0,
+			ETag:         blockIDInt32ToBase64(zbPartNum),
+			PartNumber:   int(zbPartNum),
 			LastModified: time.Now(),
 		})
-		if len(parts) >= int(maxParts) {
-			nextPartNumberMarker = partNumber
-			isTruncated = true
-			break
-		}
 	}
+
+	// Sort by part number and apply maxParts limit.
+	sort.Slice(parts, func(i, j int) bool {
+		return parts[i].PartNumber < parts[j].PartNumber
+	})
+	if int32(len(parts)) > maxParts {
+		parts = parts[:maxParts]
+		nextPartNumberMarker = parts[len(parts)-1].PartNumber
+		isTruncated = true
+	}
+
 	return s3response.ListPartsResult{
 		Bucket:               *input.Bucket,
 		Key:                  *input.Key,
@@ -1324,25 +1402,41 @@ func (az *Azure) ListParts(ctx context.Context, input *s3.ListPartsInput) (s3res
 
 // Lists all the multipart uploads initiated with .sgwtmp/multipart prefix
 func (az *Azure) ListMultipartUploads(ctx context.Context, input *s3.ListMultipartUploadsInput) (s3response.ListMultipartUploadsResult, error) {
-	client, err := az.getContainerClient(*input.Bucket)
+	var bucket string
+	if input.Bucket != nil {
+		bucket = *input.Bucket
+	}
+
+	client, err := az.getContainerClient(bucket)
 	if err != nil {
 		return s3response.ListMultipartUploadsResult{}, err
 	}
 
-	uploads := []s3response.Upload{}
-
+	var delimiter string
+	if input.Delimiter != nil {
+		delimiter = *input.Delimiter
+	}
+	var prefix string
+	if input.Prefix != nil {
+		prefix = *input.Prefix
+	}
+	var keyMarker string
+	if input.KeyMarker != nil {
+		keyMarker = *input.KeyMarker
+	}
 	var uploadIDMarker string
 	if input.UploadIdMarker != nil {
 		uploadIDMarker = *input.UploadIdMarker
 	}
-	uploadIdMarkerFound := false
-	prefix := string(metaTmpMultipartPrefix)
+	maxUploads := int(*input.MaxUploads)
 
+	mpPrefix := string(metaTmpMultipartPrefix)
 	pager := client.NewListBlobsFlatPager(&container.ListBlobsFlatOptions{
 		Include: container.ListBlobsInclude{Metadata: true},
-		Prefix:  &prefix,
+		Prefix:  &mpPrefix,
 	})
 
+	uploads := []s3response.Upload{}
 	for pager.More() {
 		resp, err := pager.NextPage(ctx)
 		if err != nil {
@@ -1353,10 +1447,10 @@ func (az *Azure) ListMultipartUploads(ctx context.Context, input *s3.ListMultipa
 			if !ok {
 				continue
 			}
-			if *key <= *input.KeyMarker {
+			if keyMarker != "" && *key <= keyMarker {
 				continue
 			}
-			if input.Prefix != nil && !strings.HasPrefix(*key, *input.Prefix) {
+			if prefix != "" && !strings.HasPrefix(*key, prefix) {
 				continue
 			}
 
@@ -1372,62 +1466,33 @@ func (az *Azure) ListMultipartUploads(ctx context.Context, input *s3.ListMultipa
 			})
 		}
 	}
-	maxUploads := 1000
-	if input.MaxUploads != nil {
-		maxUploads = int(*input.MaxUploads)
-	}
-	if *input.KeyMarker != "" && uploadIDMarker != "" && !uploadIdMarkerFound {
-		return s3response.ListMultipartUploadsResult{
-			Bucket:         *input.Bucket,
-			Delimiter:      *input.Delimiter,
-			KeyMarker:      *input.KeyMarker,
-			MaxUploads:     maxUploads,
-			Prefix:         *input.Prefix,
-			UploadIDMarker: *input.UploadIdMarker,
-			Uploads:        []s3response.Upload{},
-		}, nil
-	}
 
+	// Sort once: Key asc, Initiated asc
 	sort.SliceStable(uploads, func(i, j int) bool {
-		return uploads[i].Key < uploads[j].Key
+		if uploads[i].Key != uploads[j].Key {
+			return uploads[i].Key < uploads[j].Key
+		}
+		return uploads[i].Initiated.Before(uploads[j].Initiated)
 	})
 
-	if *input.KeyMarker != "" && *input.UploadIdMarker != "" {
-		// the uploads are already filtered by keymarker
-		// filter the uploads by uploadIdMarker
-		for i, upl := range uploads {
-			if upl.UploadID == uploadIDMarker {
-				uploads = uploads[i+1:]
-				break
-			}
-		}
+	result, err := backend.ListMultipartUploads(uploads, prefix, delimiter, keyMarker, uploadIDMarker, maxUploads)
+	if err != nil {
+		return s3response.ListMultipartUploadsResult{}, err
 	}
 
-	if len(uploads) <= maxUploads {
-		return s3response.ListMultipartUploadsResult{
-			Bucket:         *input.Bucket,
-			Delimiter:      *input.Delimiter,
-			KeyMarker:      *input.KeyMarker,
-			MaxUploads:     maxUploads,
-			Prefix:         *input.Prefix,
-			UploadIDMarker: *input.UploadIdMarker,
-			Uploads:        uploads,
-		}, nil
-	} else {
-		resUploads := uploads[:maxUploads]
-		return s3response.ListMultipartUploadsResult{
-			Bucket:             *input.Bucket,
-			Delimiter:          *input.Delimiter,
-			KeyMarker:          *input.KeyMarker,
-			NextKeyMarker:      resUploads[len(resUploads)-1].Key,
-			MaxUploads:         maxUploads,
-			Prefix:             *input.Prefix,
-			UploadIDMarker:     *input.UploadIdMarker,
-			NextUploadIDMarker: resUploads[len(resUploads)-1].UploadID,
-			IsTruncated:        true,
-			Uploads:            resUploads,
-		}, nil
-	}
+	return s3response.ListMultipartUploadsResult{
+		Bucket:             bucket,
+		Delimiter:          delimiter,
+		KeyMarker:          keyMarker,
+		MaxUploads:         maxUploads,
+		Prefix:             prefix,
+		NextKeyMarker:      result.NextKeyMarker,
+		NextUploadIDMarker: result.NextUploadIDMarker,
+		UploadIDMarker:     uploadIDMarker,
+		IsTruncated:        result.IsTruncated,
+		Uploads:            result.Uploads,
+		CommonPrefixes:     result.CommonPrefixes,
+	}, nil
 }
 
 // Deletes the block blob with committed/uncommitted blocks
@@ -1505,10 +1570,23 @@ func (az *Azure) CompleteMultipartUpload(ctx context.Context, input *s3.Complete
 
 	blockList, err := client.GetBlockList(ctx, blockblob.BlockListTypeUncommitted, nil)
 	if err != nil {
-		return res, "", azureErrToS3Err(err)
+		if !errors.Is(azureErrToS3Err(err), s3err.GetAPIError(s3err.ErrNoSuchKey)) {
+			return res, "", azureErrToS3Err(err)
+		}
+		// NoSuchKey: no blocks staged; only zero-byte parts may exist.
 	}
 
-	if len(blockList.UncommittedBlocks) != len(input.MultipartUpload.Parts) {
+	// Collect zero-byte parts tracked in the sgwtmp metadata.
+	zbParts, err := az.getZeroByteParts(ctx, *input.Bucket, *input.Key, *input.UploadId)
+	if err != nil {
+		return res, "", err
+	}
+	zbPartsMap := make(map[int32]bool, len(zbParts))
+	for _, p := range zbParts {
+		zbPartsMap[p] = true
+	}
+
+	if len(blockList.UncommittedBlocks)+len(zbParts) != len(input.MultipartUpload.Parts) {
 		return res, "", s3err.GetAPIError(s3err.ErrInvalidPart)
 	}
 
@@ -1522,10 +1600,10 @@ func (az *Azure) CompleteMultipartUpload(ctx context.Context, input *s3.Complete
 		uncommittedBlocks[int32(ptNumber)] = el
 	}
 
-	// The initialie values is the lower limit of partNumber: 0
+	// The initial value is the lower limit of partNumber: 0
 	var totalSize int64
 	var partNumber int32
-	last := len(blockList.UncommittedBlocks) - 1
+	last := len(input.MultipartUpload.Parts) - 1
 	for i, part := range input.MultipartUpload.Parts {
 		if part.PartNumber == nil {
 			return res, "", s3err.GetAPIError(s3err.ErrInvalidPart)
@@ -1540,6 +1618,19 @@ func (az *Azure) CompleteMultipartUpload(ctx context.Context, input *s3.Complete
 
 		block, ok := uncommittedBlocks[*part.PartNumber]
 		if !ok {
+			// Check if this is a tracked zero-byte part.
+			if zbPartsMap[*part.PartNumber] {
+				expectedETag := blockIDInt32ToBase64(*part.PartNumber)
+				if getString(part.ETag) != expectedETag {
+					return res, "", s3err.GetAPIError(s3err.ErrInvalidPart)
+				}
+				// Non-last zero-byte parts violate the minimum part size.
+				if i < last {
+					return res, "", s3err.GetAPIError(s3err.ErrEntityTooSmall)
+				}
+				// Zero-byte parts contribute no data; skip adding to blockIds.
+				continue
+			}
 			return res, "", s3err.GetAPIError(s3err.ErrInvalidPart)
 		}
 
@@ -1556,8 +1647,12 @@ func (az *Azure) CompleteMultipartUpload(ctx context.Context, input *s3.Complete
 	}
 
 	if input.MpuObjectSize != nil && totalSize != *input.MpuObjectSize {
-		return res, "", s3err.GetIncorrectMpObjectSizeErr(totalSize, *input.MpuObjectSize)
+		return res, "",
+			s3err.GetIncorrectMpObjectSizeErr(totalSize, *input.MpuObjectSize)
 	}
+
+	// Remove internal tracking keys from metadata before storing on the final blob.
+	delete(props.Metadata, string(keyMpZeroBytesParts))
 
 	opts := &blockblob.CommitBlockListOptions{
 		Metadata: props.Metadata,
@@ -1644,24 +1739,6 @@ func (az *Azure) DeleteBucketCors(ctx context.Context, bucket string) error {
 }
 
 func (az *Azure) PutObjectLockConfiguration(ctx context.Context, bucket string, config []byte) error {
-	cfg, err := az.getContainerMetaData(ctx, bucket, string(keyBucketLock))
-	if err != nil {
-		return err
-	}
-
-	if len(cfg) == 0 {
-		return s3err.GetAPIError(s3err.ErrObjectLockConfigurationNotAllowed)
-	}
-
-	var bucketLockCfg auth.BucketLockConfig
-	if err := json.Unmarshal(cfg, &bucketLockCfg); err != nil {
-		return fmt.Errorf("unmarshal object lock config: %w", err)
-	}
-
-	if !bucketLockCfg.Enabled {
-		return s3err.GetAPIError(s3err.ErrObjectLockConfigurationNotAllowed)
-	}
-
 	return az.setContainerMetaData(ctx, bucket, string(keyBucketLock), config)
 }
 
@@ -1678,7 +1755,7 @@ func (az *Azure) GetObjectLockConfiguration(ctx context.Context, bucket string) 
 	return cfg, nil
 }
 
-func (az *Azure) PutObjectRetention(ctx context.Context, bucket, object, versionId string, bypass bool, retention []byte) error {
+func (az *Azure) PutObjectRetention(ctx context.Context, bucket, object, versionId string, retention []byte) error {
 	err := az.isBucketObjectLockEnabled(ctx, bucket)
 	if err != nil {
 		return err
@@ -1700,28 +1777,7 @@ func (az *Azure) PutObjectRetention(ctx context.Context, bucket, object, version
 			string(keyObjRetention): backend.GetPtrFromString(string(retention)),
 		}
 	} else {
-		objLockCfg, ok := meta[string(keyObjRetention)]
-		if !ok {
-			meta[string(keyObjRetention)] = backend.GetPtrFromString(string(retention))
-		} else {
-			var lockCfg types.ObjectLockRetention
-			if err := json.Unmarshal([]byte(*objLockCfg), &lockCfg); err != nil {
-				return fmt.Errorf("unmarshal object lock config: %w", err)
-			}
-
-			switch lockCfg.Mode {
-			// Compliance mode can't be overridden
-			case types.ObjectLockRetentionModeCompliance:
-				return s3err.GetAPIError(s3err.ErrMethodNotAllowed)
-			// To override governance mode user should have "s3:BypassGovernanceRetention" permission
-			case types.ObjectLockRetentionModeGovernance:
-				if !bypass {
-					return s3err.GetAPIError(s3err.ErrMethodNotAllowed)
-				}
-			}
-
-			meta[string(keyObjRetention)] = backend.GetPtrFromString(string(retention))
-		}
+		meta[string(keyObjRetention)] = backend.GetPtrFromString(string(retention))
 	}
 
 	_, err = blobClient.SetMetadata(ctx, meta, nil)
@@ -1859,16 +1915,17 @@ func (az *Azure) isBucketObjectLockEnabled(ctx context.Context, bucket string) e
 	}
 
 	if len(cfg) == 0 {
-		return s3err.GetAPIError(s3err.ErrInvalidBucketObjectLockConfiguration)
+		return s3err.GetAPIError(s3err.ErrMissingObjectLockConfiguration)
 	}
 
 	var bucketLockConfig auth.BucketLockConfig
-	if err := json.Unmarshal(cfg, &bucketLockConfig); err != nil {
+	err = json.Unmarshal(cfg, &bucketLockConfig)
+	if err != nil {
 		return fmt.Errorf("parse bucket lock config: %w", err)
 	}
 
 	if !bucketLockConfig.Enabled {
-		return s3err.GetAPIError(s3err.ErrInvalidBucketObjectLockConfiguration)
+		return s3err.GetAPIError(s3err.ErrMissingObjectLockConfiguration)
 	}
 
 	return nil
@@ -1879,7 +1936,10 @@ func (az *Azure) getContainerURL(cntr string) string {
 }
 
 func (az *Azure) getBlobURL(cntr, blb string) string {
-	return fmt.Sprintf("%v/%v", az.getContainerURL(cntr), blb)
+	// URL-encode the blob name to handle special characters like {, }, #, spaces, etc.
+	// Use PathEscape to encode the blob name while preserving forward slashes
+	encodedBlob := url.PathEscape(blb)
+	return fmt.Sprintf("%v/%v", az.getContainerURL(cntr), encodedBlob)
 }
 
 func (az *Azure) getBlobClient(cntr, blb string) (*blob.Client, error) {
@@ -2105,22 +2165,20 @@ func (az *Azure) evaluateWritePreconditions(ctx context.Context, bucket, object,
 		return nil
 	}
 	// call HeadObject to evaluate preconditions
-	// if object doesn't exist, move forward with the object creation
-	// otherwise return the error
-	_, err := az.HeadObject(ctx, &s3.HeadObjectInput{
-		Bucket:      bucket,
-		Key:         object,
-		IfMatch:     ifMatch,
-		IfNoneMatch: ifNoneMatch,
+	res, err := az.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: bucket,
+		Key:    object,
 	})
-	if errors.Is(err, s3err.GetAPIError(s3err.ErrNotModified)) {
-		return s3err.GetAPIError(s3err.ErrPreconditionFailed)
-	}
 	if err != nil && !errors.Is(err, s3err.GetAPIError(s3err.ErrNoSuchKey)) {
 		return err
 	}
 
-	return nil
+	var etag string
+	if res != nil {
+		etag = backend.GetStringFromPtr(res.ETag)
+	}
+
+	return backend.EvaluateObjectPutPreconditions(etag, ifMatch, ifNoneMatch, !errors.Is(err, s3err.GetAPIError(s3err.ErrNoSuchKey)))
 }
 
 func getAclFromMetadata(meta map[string]*string, key key) (*auth.ACL, error) {
@@ -2145,6 +2203,77 @@ func getAclFromMetadata(meta map[string]*string, key key) (*auth.ACL, error) {
 func createMetaTmpPath(obj, uploadId string) string {
 	objNameSum := sha256.Sum256([]byte(obj))
 	return filepath.Join(string(metaTmpMultipartPrefix), uploadId, fmt.Sprintf("%x", objNameSum))
+}
+
+// trackZeroBytePart records a zero-byte upload part in the sgwtmp metadata.
+// Azure StageBlock rejects Content-Length: 0, so zero-byte parts are stored here.
+func (az *Azure) trackZeroBytePart(ctx context.Context, bucket, key, uploadId string, partNumber int32) error {
+	tmpPath := createMetaTmpPath(key, uploadId)
+	blobClient, err := az.getBlobClient(bucket, tmpPath)
+	if err != nil {
+		return err
+	}
+
+	props, err := blobClient.GetProperties(ctx, nil)
+	if err != nil {
+		return azureErrToS3Err(err)
+	}
+
+	meta := props.Metadata
+	if meta == nil {
+		meta = map[string]*string{}
+	}
+
+	// Deduplicate: replace an existing entry for the same partNumber.
+	parts := parseZeroByteParts(meta)
+	found := slices.Contains(parts, partNumber)
+	if !found {
+		parts = append(parts, partNumber)
+	}
+
+	serialized := serializeZeroByteParts(parts)
+	meta[string(keyMpZeroBytesParts)] = &serialized
+	_, err = blobClient.SetMetadata(ctx, meta, nil)
+	return azureErrToS3Err(err)
+}
+
+// getZeroByteParts returns the list of zero-byte parts tracked in the sgwtmp metadata.
+func (az *Azure) getZeroByteParts(ctx context.Context, bucket, key, uploadId string) ([]int32, error) {
+	tmpPath := createMetaTmpPath(key, uploadId)
+	blobClient, err := az.getBlobClient(bucket, tmpPath)
+	if err != nil {
+		return nil, err
+	}
+
+	props, err := blobClient.GetProperties(ctx, nil)
+	if err != nil {
+		return nil, azureErrToS3Err(err)
+	}
+
+	return parseZeroByteParts(props.Metadata), nil
+}
+
+func parseZeroByteParts(meta map[string]*string) []int32 {
+	val, ok := meta[string(keyMpZeroBytesParts)]
+	if !ok || val == nil || *val == "" {
+		return nil
+	}
+	var parts []int32
+	for s := range strings.SplitSeq(*val, ",") {
+		n, err := strconv.ParseInt(strings.TrimSpace(s), 10, 32)
+		if err == nil {
+			parts = append(parts, int32(n))
+		}
+	}
+	return parts
+}
+
+func serializeZeroByteParts(parts []int32) string {
+	strs := make([]string, len(parts))
+	for i, p := range parts {
+		strs[i] = strconv.Itoa(int(p))
+	}
+	return strings.Join(strs, ",")
 }
 
 // Checks if the multipart upload existis with the given bucket, key and uploadId

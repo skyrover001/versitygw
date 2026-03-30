@@ -15,10 +15,13 @@
 package controllers
 
 import (
+	"errors"
+
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/gofiber/fiber/v2"
 	"github.com/versity/versitygw/auth"
 	"github.com/versity/versitygw/s3api/utils"
+	"github.com/versity/versitygw/s3err"
 )
 
 func (c S3ApiController) HeadBucket(ctx *fiber.Ctx) (*Response, error) {
@@ -39,9 +42,13 @@ func (c S3ApiController) HeadBucket(ctx *fiber.Ctx) (*Response, error) {
 			Bucket:          bucket,
 			Action:          auth.ListBucketAction,
 			IsPublicRequest: isPublicBucket,
+			DisableACL:      c.disableACL,
 		})
 	if err != nil {
 		return &Response{
+			Headers: map[string]*string{
+				"x-amz-bucket-region": utils.GetStringPtr(region),
+			},
 			MetaOpts: &MetaOptions{
 				BucketOwner: parsedAcl.Owner,
 			},
@@ -54,6 +61,17 @@ func (c S3ApiController) HeadBucket(ctx *fiber.Ctx) (*Response, error) {
 		})
 
 	if err != nil {
+		if errors.Is(err, s3err.GetAPIError(s3err.ErrAccessDenied)) {
+			return &Response{
+				// access denied for head object still returns region header
+				Headers: map[string]*string{
+					"x-amz-bucket-region": utils.GetStringPtr(region),
+				},
+				MetaOpts: &MetaOptions{
+					BucketOwner: parsedAcl.Owner,
+				},
+			}, err
+		}
 		return &Response{
 			MetaOpts: &MetaOptions{
 				BucketOwner: parsedAcl.Owner,
@@ -63,8 +81,8 @@ func (c S3ApiController) HeadBucket(ctx *fiber.Ctx) (*Response, error) {
 
 	return &Response{
 		Headers: map[string]*string{
-			"X-Amz-Access-Point-Alias": utils.GetStringPtr("false"),
-			"X-Amz-Bucket-Region":      utils.GetStringPtr(region),
+			"x-amz-access-point-alias": utils.GetStringPtr("false"),
+			"x-amz-bucket-region":      utils.GetStringPtr(region),
 		},
 		MetaOpts: &MetaOptions{
 			BucketOwner: parsedAcl.Owner,

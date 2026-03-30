@@ -16,7 +16,6 @@
 
 get_object() {
   log 6 "get_object"
-  record_command "get-object" "client:$1"
   if [ $# -ne 4 ]; then
     log 2 "get object command requires command type, bucket, key, destination"
     return 1
@@ -27,7 +26,7 @@ get_object() {
   elif [[ $1 == 's3api' ]]; then
     get_object_error=$(send_command aws --no-verify-ssl s3api get-object --bucket "$2" --key "$3" "$4" 2>&1) || exit_code=$?
   elif [[ $1 == 's3cmd' ]]; then
-    get_object_error=$(send_command s3cmd "${S3CMD_OPTS[@]}" --no-check-certificate get "s3://$2/$3" "$4" 2>&1) || exit_code=$?
+    get_object_error=$(send_command s3cmd "${S3CMD_OPTS[@]}" --no-check-certificate get --force "s3://$2/$3" "$4" 2>&1) || exit_code=$?
   elif [[ $1 == 'mc' ]]; then
     get_object_error=$(send_command mc --insecure get "$MC_ALIAS/$2/$3" "$4" 2>&1) || exit_code=$?
   elif [[ $1 == 'rest' ]]; then
@@ -45,7 +44,6 @@ get_object() {
 }
 
 get_object_with_range() {
-  record_command "get-object" "client:s3api"
   if [[ $# -ne 4 ]]; then
     log 2 "'get object with range' requires bucket, key, range, outfile"
     return 1
@@ -59,7 +57,6 @@ get_object_with_range() {
 
 get_object_with_user() {
   log 6 "get_object_with_user"
-  record_command "get-object" "client:$1"
   if [ $# -ne 6 ]; then
     log 2 "'get object with user' command requires command type, bucket, key, save location, aws ID, aws secret key"
     return 1

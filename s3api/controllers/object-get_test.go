@@ -26,6 +26,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/oklog/ulid/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/versity/versitygw/s3api/utils"
 	"github.com/versity/versitygw/s3err"
@@ -33,6 +34,7 @@ import (
 )
 
 func TestS3ApiController_GetObjectTagging(t *testing.T) {
+	versionId := ulid.Make().String()
 	tests := []struct {
 		name   string
 		input  testInput
@@ -50,6 +52,23 @@ func TestS3ApiController_GetObjectTagging(t *testing.T) {
 					},
 				},
 				err: s3err.GetAPIError(s3err.ErrAccessDenied),
+			},
+		},
+		{
+			name: "invalid versionId",
+			input: testInput{
+				locals: defaultLocals,
+				queries: map[string]string{
+					"versionId": "invalid_versionId",
+				},
+			},
+			output: testOutput{
+				response: &Response{
+					MetaOpts: &MetaOptions{
+						BucketOwner: "root",
+					},
+				},
+				err: s3err.GetAPIError(s3err.ErrInvalidVersionId),
 			},
 		},
 		{
@@ -71,6 +90,9 @@ func TestS3ApiController_GetObjectTagging(t *testing.T) {
 		{
 			name: "successful response",
 			input: testInput{
+				queries: map[string]string{
+					"versionId": versionId,
+				},
 				locals: defaultLocals,
 				beRes: map[string]string{
 					"key": "val",
@@ -78,6 +100,9 @@ func TestS3ApiController_GetObjectTagging(t *testing.T) {
 			},
 			output: testOutput{
 				response: &Response{
+					Headers: map[string]*string{
+						"x-amz-version-id": utils.GetStringPtr(versionId),
+					},
 					Data: s3response.Tagging{
 						TagSet: s3response.TagSet{
 							Tags: []s3response.Tag{
@@ -95,7 +120,7 @@ func TestS3ApiController_GetObjectTagging(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			be := &BackendMock{
-				GetObjectTaggingFunc: func(contextMoqParam context.Context, bucket, object string) (map[string]string, error) {
+				GetObjectTaggingFunc: func(contextMoqParam context.Context, bucket, object, versionId string) (map[string]string, error) {
 					return tt.input.beRes.(map[string]string), tt.input.beErr
 				},
 				GetBucketPolicyFunc: func(contextMoqParam context.Context, bucket string) ([]byte, error) {
@@ -113,8 +138,9 @@ func TestS3ApiController_GetObjectTagging(t *testing.T) {
 				tt.output.response,
 				tt.output.err,
 				ctxInputs{
-					locals: tt.input.locals,
-					body:   tt.input.body,
+					locals:  tt.input.locals,
+					body:    tt.input.body,
+					queries: tt.input.queries,
 				})
 		})
 	}
@@ -145,6 +171,23 @@ func TestS3ApiController_GetObjectRetention(t *testing.T) {
 					},
 				},
 				err: s3err.GetAPIError(s3err.ErrAccessDenied),
+			},
+		},
+		{
+			name: "invalid versionId",
+			input: testInput{
+				locals: defaultLocals,
+				queries: map[string]string{
+					"versionId": "invalid_versionId",
+				},
+			},
+			output: testOutput{
+				response: &Response{
+					MetaOpts: &MetaOptions{
+						BucketOwner: "root",
+					},
+				},
+				err: s3err.GetAPIError(s3err.ErrInvalidVersionId),
 			},
 		},
 		{
@@ -218,8 +261,9 @@ func TestS3ApiController_GetObjectRetention(t *testing.T) {
 				tt.output.response,
 				tt.output.err,
 				ctxInputs{
-					locals: tt.input.locals,
-					body:   tt.input.body,
+					locals:  tt.input.locals,
+					body:    tt.input.body,
+					queries: tt.input.queries,
 				})
 		})
 	}
@@ -247,6 +291,23 @@ func TestS3ApiController_GetObjectLegalHold(t *testing.T) {
 					},
 				},
 				err: s3err.GetAPIError(s3err.ErrAccessDenied),
+			},
+		},
+		{
+			name: "invalid versionId",
+			input: testInput{
+				locals: defaultLocals,
+				queries: map[string]string{
+					"versionId": "invalid_versionId",
+				},
+			},
+			output: testOutput{
+				response: &Response{
+					MetaOpts: &MetaOptions{
+						BucketOwner: "root",
+					},
+				},
+				err: s3err.GetAPIError(s3err.ErrInvalidVersionId),
 			},
 		},
 		{
@@ -305,8 +366,9 @@ func TestS3ApiController_GetObjectLegalHold(t *testing.T) {
 				tt.output.response,
 				tt.output.err,
 				ctxInputs{
-					locals: tt.input.locals,
-					body:   tt.input.body,
+					locals:  tt.input.locals,
+					body:    tt.input.body,
+					queries: tt.input.queries,
 				})
 		})
 	}
@@ -435,7 +497,7 @@ func TestS3ApiController_ListParts(t *testing.T) {
 			input: testInput{
 				locals: defaultLocals,
 				queries: map[string]string{
-					"part-number-marker": "-1",
+					"part-number-marker": "foo",
 				},
 			},
 			output: testOutput{
@@ -444,11 +506,11 @@ func TestS3ApiController_ListParts(t *testing.T) {
 						BucketOwner: "root",
 					},
 				},
-				err: s3err.GetAPIError(s3err.ErrInvalidPartNumberMarker),
+				err: s3err.GetInvalidMaxLimiterErr(utils.LimiterTypePartNumberMarker),
 			},
 		},
 		{
-			name: "invalid max parts",
+			name: "negative max parts",
 			input: testInput{
 				locals: defaultLocals,
 				queries: map[string]string{
@@ -461,7 +523,7 @@ func TestS3ApiController_ListParts(t *testing.T) {
 						BucketOwner: "root",
 					},
 				},
-				err: s3err.GetAPIError(s3err.ErrInvalidMaxParts),
+				err: s3err.GetNegativeMaxLimiterErr(utils.LimiterTypeMaxParts),
 			},
 		},
 		{
@@ -556,11 +618,11 @@ func TestS3ApiController_GetObjectAttributes(t *testing.T) {
 			},
 		},
 		{
-			name: "invalid max parts",
+			name: "invalid versionId",
 			input: testInput{
 				locals: defaultLocals,
-				headers: map[string]string{
-					"X-Amz-Max-Parts": "-1",
+				queries: map[string]string{
+					"versionId": "invalid_versionId",
 				},
 			},
 			output: testOutput{
@@ -569,7 +631,7 @@ func TestS3ApiController_GetObjectAttributes(t *testing.T) {
 						BucketOwner: "root",
 					},
 				},
-				err: s3err.GetAPIError(s3err.ErrInvalidMaxParts),
+				err: s3err.GetAPIError(s3err.ErrInvalidVersionId),
 			},
 		},
 		{
@@ -663,6 +725,7 @@ func TestS3ApiController_GetObjectAttributes(t *testing.T) {
 					locals:  tt.input.locals,
 					body:    tt.input.body,
 					headers: tt.input.headers,
+					queries: tt.input.queries,
 				})
 		})
 	}
@@ -691,6 +754,23 @@ func TestS3ApiController_GetObject(t *testing.T) {
 					},
 				},
 				err: s3err.GetAPIError(s3err.ErrAccessDenied),
+			},
+		},
+		{
+			name: "invalid versionId",
+			input: testInput{
+				locals: defaultLocals,
+				queries: map[string]string{
+					"versionId": "invalid_versionId",
+				},
+			},
+			output: testOutput{
+				response: &Response{
+					MetaOpts: &MetaOptions{
+						BucketOwner: "root",
+					},
+				},
+				err: s3err.GetAPIError(s3err.ErrInvalidVersionId),
 			},
 		},
 		{
@@ -757,7 +837,7 @@ func TestS3ApiController_GetObject(t *testing.T) {
 					"Range": "100-200",
 				},
 				queries: map[string]string{
-					"versionId": "versionId",
+					"versionId": "01BX5ZZKBKACTAV9WEVGEMMVRZ",
 				},
 				locals: defaultLocals,
 				beRes: &s3.GetObjectOutput{

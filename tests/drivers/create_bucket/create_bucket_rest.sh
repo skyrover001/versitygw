@@ -14,8 +14,10 @@
 # specific language governing permissions and limitations
 # under the License.
 
+source ./tests/drivers/delete_bucket/delete_bucket_rest.sh
 source ./tests/drivers/get_bucket_acl/get_bucket_acl_rest.sh
 source ./tests/drivers/get_object/get_object_rest.sh
+source ./tests/drivers/list_objects/list_objects_rest.sh
 source ./tests/drivers/put_bucket_acl/put_bucket_acl_rest.sh
 source ./tests/drivers/put_object/put_object_rest.sh
 source ./tests/drivers/user.sh
@@ -47,8 +49,14 @@ setup_and_create_bucket_and_check_acl() {
   log 5 "username=$username, password=$password"
   envs="$1=$id OBJECT_OWNERSHIP=BucketOwnerPreferred"
   log 5 "envs: $envs"
+
+  if ! bucket_name=$(get_bucket_name "$BUCKET_ONE_NAME" 2>&1); then
+    log 2 "error retrieving bucket name: $bucket_name"
+    return 1
+  fi
+
   # shellcheck disable=SC2154
-  if ! create_bucket_and_check_acl "$BUCKET_ONE_NAME" "$envs" "$username" "$password" "$user_canonical_id" "$owner_canonical_id"; then
+  if ! create_bucket_and_check_acl "$bucket_name" "$envs" "$username" "$password" "$user_canonical_id" "$owner_canonical_id"; then
     log 2 "error creating bucket and checking ACL"
     return 1
   fi
@@ -108,6 +116,243 @@ create_bucket_and_check_acl() {
   log 5 "acl file: $(cat "$TEST_FILE_FOLDER/acl-file.txt")"
   if ! put_bucket_acl_success_or_access_denied "$1" "$TEST_FILE_FOLDER/acl-file.txt" "$3" "$4" "$write_acp"; then
     log 2 "put ACL permissions mismatch"
+    return 1
+  fi
+  return 0
+}
+
+get_bucket_prefix() {
+  if ! check_param_count_v2 "bucket prefix or name" 1 $#; then
+    return 1
+  fi
+  if [ "$RECREATE_BUCKETS" == "true" ]; then
+    # remove date/time suffix
+    prefix="$(echo "$1" | awk '{print substr($0, 1, length($0)-15)}')"
+  else
+    prefix="$1"
+  fi
+  echo "$prefix"
+}
+
+setup_bucket_v2() {
+  log 6 "setup_bucket_v2 '$1'"
+  if ! check_param_count_v2 "bucket prefix or name" 1 $#; then
+    return 1
+  fi
+  if ! prefix=$(get_bucket_prefix "$1" 2>&1); then
+    log 2 "error getting prefix: $prefix"
+    return 1
+  fi
+  log 5 "bucket prefix: $prefix"
+  if ! bucket_cleanup_if_bucket_exists_v2 "$prefix"; then
+    log 2 "error cleaning up bucket(s), if it/they exist(s)"
+    return 1
+  fi
+  if [ "$RECREATE_BUCKETS" == "false" ]; then
+    return 0
+  fi
+  if ! create_bucket_rest_expect_success "$1" ""; then
+    log 2 "error creating bucket '$1'"
+    return 1
+  fi
+  return 0
+}
+
+setup_bucket_v3() {
+  if ! check_param_count_v2 "bucket env var" 1 $#; then
+    return 1
+  fi
+  if ! error=$(bucket_cleanup_if_bucket_exists_v2 "$1" 2>&1); then
+    log 2 "error cleaning up bucket(s), if it/they exist(s): $error"
+    return 1
+  fi
+  if [ "$RECREATE_BUCKETS" == "false" ]; then
+    echo "$1"
+    return 0
+  else
+    if ! bucket_name=$(get_bucket_name "$1" 2>&1); then
+      log 2 "error getting bucket name: $bucket_name"
+      return 1
+    fi
+    if ! error=$(create_bucket_rest_expect_success "$bucket_name" "" 2>&1); then
+      log 2 "error creating bucket named '$bucket_name': $error"
+      return 1
+    fi
+  fi
+  echo "$bucket_name"
+  return 0
+}
+
+# params:  client, bucket name(s)
+# return 0 for success, 1 for failure
+setup_buckets() {
+  if ! check_param_count_gt "minimum of 1 bucket name" 1 $#; then
+    return 1
+  fi
+  for name in "$@"; do
+    if ! setup_bucket "$name"; then
+      log 2 "error setting up bucket $name"
+      return 1
+    fi
+  done
+  return 0
+}
+
+setup_buckets_v2() {
+  if ! check_param_count_gt "minimum of 1 bucket name" 1 $#; then
+    return 1
+  fi
+  for name in "$@"; do
+    if ! setup_bucket_v2 "$name"; then
+      log 2 "error setting up bucket $name"
+      return 1
+    fi
+  done
+  return 0
+}
+
+setup_buckets_v3() {
+  if ! check_param_count_gt "minimum of 1 bucket env var" 1 $#; then
+    return 1
+  fi
+  local buckets=()
+  for name in "$@"; do
+    if ! bucket=$(setup_bucket_v3 "$name" 2>&1); then
+      log 2 "error setting up bucket '$name': $bucket"
+      return 1
+    fi
+    buckets+=("$bucket")
+  done
+  echo "${buckets[*]}"
+  return 0
+}
+
+get_bucket_name() {
+  if ! check_param_count_v2 "bucket" 1 $#; then
+    return 1
+  fi
+  if [ "$RECREATE_BUCKETS" == "false" ]; then
+    echo "$1"
+    return 0
+  fi
+  if ! uuid=$(uuidgen 2>&1); then
+    log 2 "error getting UUID: $uuid"
+    return 1
+  fi
+  local bucket_name
+  bucket_name="$1-${uuid,,}"
+  echo "${bucket_name:0:63}"
+  return 0
+}
+
+setup_bucket_object_lock_enabled_v2() {
+  if ! check_param_count_v2 "bucket" 1 $#; then
+    return 1
+  fi
+  if ! prefix=$(get_bucket_prefix "$1" 2>&1); then
+    log 2 "error getting prefix: $prefix"
+    return 1
+  fi
+  if ! bucket_cleanup_if_bucket_exists_v2 "$prefix"; then
+    log 2 "error cleaning up bucket"
+    return 1
+  fi
+  if [ "$RECREATE_BUCKETS" == "true" ]; then
+    if ! create_bucket_object_lock_enabled "$1"; then
+      log 2 "error creating bucket '$1' with object lock enabled"
+      return 1
+    fi
+  fi
+  return 0
+}
+
+setup_bucket_object_lock_enabled() {
+  if ! check_param_count "setup_bucket_object_lock_enabled" "bucket" 1 $#; then
+    return 1
+  fi
+  if ! bucket_cleanup_if_bucket_exists "$1"; then
+    log 2 "error cleaning up bucket"
+    return 1
+  fi
+
+  # in static bucket config, bucket will still exist
+  if ! bucket_exists "$1"; then
+    if ! create_bucket_object_lock_enabled "$1"; then
+      log 2 "error creating bucket with object lock enabled"
+      return 1
+    fi
+  fi
+  return 0
+}
+
+send_curl_command_create_bucket_expect_error() {
+  if ! check_param_count_gt "response code, error code, message, params" 4 $#; then
+    return 1
+  fi
+  if ! send_curl_command_create_bucket_expect_error_callback "$1" "$2" "$3" "" "${@:4}"; then
+    log 2 "error sending curl create bucket command"
+    return 1
+  fi
+  return 0
+}
+
+send_curl_command_create_bucket_expect_error_callback() {
+  if ! check_param_count_gt "response code, error code, message, callback, params" 5 $#; then
+    return 1
+  fi
+  if ! bucket_name=$(get_bucket_name "$BUCKET_ONE_NAME" 2>&1); then
+    log 2 "error getting bucket name from '$BUCKET_ONE_NAME': $bucket_name"
+    return 1
+  fi
+  if ! send_rest_go_command_expect_error "$1" "$2" "$3" "-bucketName" "$bucket_name" "-commandType" "createBucket" "${@:5}"; then
+    log 2 "error sending rest go command"
+    return 1
+  fi
+  if [ "$4" != "" ] && ! "$4" "$TEST_FILE_FOLDER/result.txt"; then
+    log 2 "callback error"
+    return 1
+  fi
+  return 0
+}
+
+send_invalid_location_constraint_check_error() {
+  if ! check_param_count_v2 "invalid param" 1 $#; then
+    return 1
+  fi
+  invalid_location_constraint="$1"
+  if ! send_curl_command_create_bucket_expect_error_callback "400" "InvalidLocationConstraint" "The specified location-constraint is not valid" \
+      "check_location_constraint_param" "-locationConstraint" "$invalid_location_constraint"; then
+    log 2 "error sending curl command and checking callback"
+    return 1
+  fi
+  return 0
+}
+
+check_location_constraint_param() {
+  if ! check_param_count_v2 "file" 1 $#; then
+    return 1
+  fi
+  if ! check_error_parameter "$1" "LocationConstraint" "$invalid_location_constraint"; then
+    log 2 "location constraint mismatch"
+    return 1
+  fi
+  return 0
+}
+
+create_bucket_and_run_command() {
+  if ! check_param_count_gt "bucket, command, params" 2 $#; then
+    return 1
+  fi
+  if ! bucket_name=$(get_bucket_name "$1" 2>&1); then
+    log 2 "error creating bucket '$1': $bucket_name"
+    return 1
+  fi
+  if ! setup_bucket "$bucket_name"; then
+    log 2 "error setting up bucket"
+    return 1
+  fi
+  if ! "$2" "$bucket_name" "${@:3}"; then
+    log 2 "error running command on bucket"
     return 1
   fi
   return 0

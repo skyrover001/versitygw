@@ -14,13 +14,14 @@
 # specific language governing permissions and limitations
 # under the License.
 
+source ./tests/drivers/list_parts/list_parts_rest.sh
+
 complete_multipart_upload() {
   if [[ $# -ne 4 ]]; then
     log 2 "'complete multipart upload' command requires bucket, key, upload ID, parts list"
     return 1
   fi
   log 5 "complete multipart upload id: $3, parts: $4"
-  record_command "complete-multipart-upload" "client:s3api"
   error=$(send_command aws --no-verify-ssl s3api complete-multipart-upload --bucket "$1" --key "$2" --upload-id "$3" --multipart-upload '{"Parts": '"$4"'}' 2>&1) || local completed=$?
   if [[ $completed -ne 0 ]]; then
     log 2 "error completing multipart upload: $error"
@@ -92,6 +93,7 @@ complete_multipart_upload_rest_invalid_checksum() {
   if ! check_param_count_v2 "bucket, key, upload ID, parts payload, type, algorithm, correct hash" 7 $#; then
     return 1
   fi
+  log 5 "bucket name: $1"
   if ! result=$(COMMAND_LOG="$COMMAND_LOG" BUCKET_NAME="$1" OBJECT_KEY="$2" UPLOAD_ID="$3" PARTS="$4" CHECKSUM_TYPE="$5" CHECKSUM_ALGORITHM="$6" CHECKSUM_HASH="$7" OUTPUT_FILE="$TEST_FILE_FOLDER/result.txt" ./tests/rest_scripts/complete_multipart_upload.sh 2>&1); then
     log 2 "error completing multipart upload: $result"
     return 1

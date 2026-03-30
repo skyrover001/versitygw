@@ -18,7 +18,7 @@ allow_public_access() {
   if ! check_param_count_v2 "bucket name" 1 $#; then
     return 1
   fi
-  if ! result=$(COMMAND_LOG="$COMMAND_LOG" BUCKET_NAME="$1" BLOCK_PUBLIC_ACLS="FALSE" IGNORE_PUBLIC_ACLS="FALSE" RESTRICT_PUBLIC_BUCKETS="FALSE" OUTPUT_FILE="$TEST_FILE_FOLDER/response.txt" ./tests/rest_scripts/put_public_access_block.sh 2>&1); then
+  if ! result=$(COMMAND_LOG="$COMMAND_LOG" BUCKET_NAME="$1" BLOCK_PUBLIC_ACLS="FALSE" BLOCK_PUBLIC_POLICY="FALSE" IGNORE_PUBLIC_ACLS="FALSE" RESTRICT_PUBLIC_BUCKETS="FALSE" OUTPUT_FILE="$TEST_FILE_FOLDER/response.txt" ./tests/rest_scripts/put_public_access_block.sh 2>&1); then
     log 2 "error getting public access block: $result"
     return 1
   fi

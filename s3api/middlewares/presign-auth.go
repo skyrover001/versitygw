@@ -24,7 +24,7 @@ import (
 	"github.com/versity/versitygw/s3err"
 )
 
-func VerifyPresignedV4Signature(root RootUserConfig, iam auth.IAMService, region string) fiber.Handler {
+func VerifyPresignedV4Signature(root RootUserConfig, iam auth.IAMService, region string, streamBody bool) fiber.Handler {
 	acct := accounts{root: root, iam: iam}
 
 	return func(ctx *fiber.Ctx) error {
@@ -32,8 +32,13 @@ func VerifyPresignedV4Signature(root RootUserConfig, iam auth.IAMService, region
 		if utils.ContextKeyPublicBucket.IsSet(ctx) {
 			return nil
 		}
-		if ctx.Query("X-Amz-Signature") == "" {
+		if !utils.IsPresignedURLAuth(ctx) {
 			return nil
+		}
+
+		if ctx.Request().URI().QueryArgs().Has("X-Amz-Security-Token") {
+			// OIDC Authorization with X-Amz-Security-Token is not supported
+			return s3err.QueryAuthErrors.SecurityTokenNotSupported()
 		}
 
 		// Set in the context the "authenticated" key, in case the authentication succeeds,
@@ -66,7 +71,7 @@ func VerifyPresignedV4Signature(root RootUserConfig, iam auth.IAMService, region
 			}
 		}
 
-		if utils.IsBigDataAction(ctx) {
+		if streamBody {
 			// Content-Length has to be set for data uploads: PutObject, UploadPart
 			if contentLengthStr == "" {
 				return s3err.GetAPIError(s3err.ErrMissingContentLength)
@@ -83,7 +88,7 @@ func VerifyPresignedV4Signature(root RootUserConfig, iam auth.IAMService, region
 			return nil
 		}
 
-		err = utils.CheckPresignedSignature(ctx, authData, account.Secret)
+		err = utils.CheckPresignedSignature(ctx, authData, account.Secret, streamBody)
 		if err != nil {
 			return err
 		}

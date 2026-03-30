@@ -22,10 +22,20 @@ list_objects_v2() {
     log 2 "list objects command missing bucket and/or path"
     return 1
   fi
-  record_command "list-objects-v2 client:s3api"
   objects=$(send_command aws --no-verify-ssl s3api list-objects-v2 --bucket "$1") || local result=$?
   if [[ $result -ne 0 ]]; then
     log 2 "error listing objects: $objects"
     return 1
   fi
+}
+
+list_objects_v2_rest_callback() {
+  if ! check_param_count_gt "bucket, expected response code, callback fn, params" 3 $#; then
+    return 1
+  fi
+  if ! send_rest_go_command_callback "$2" "$3" "-bucketName" "$1" "-method" "GET" "-query" "list-type=2" "${@:4}"; then
+    log 2 "error sending REST ListObjectsV2 command or parsing callback"
+    return 1
+  fi
+  return 0
 }

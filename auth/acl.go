@@ -25,6 +25,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/versity/versitygw/backend"
+	"github.com/versity/versitygw/debuglogger"
 	"github.com/versity/versitygw/s3err"
 )
 
@@ -245,7 +246,7 @@ func ParseACLOutput(data []byte, owner string) (GetBucketAclOutput, error) {
 	}, nil
 }
 
-func UpdateACL(input *PutBucketAclInput, acl ACL, iam IAMService, isAdmin bool) ([]byte, error) {
+func UpdateACL(input *PutBucketAclInput, acl ACL, iam IAMService) ([]byte, error) {
 	if input == nil {
 		return nil, s3err.GetAPIError(s3err.ErrInvalidRequest)
 	}
@@ -413,7 +414,17 @@ func splitUnique(s, divider string) []string {
 	return result
 }
 
-func verifyACL(acl ACL, access string, permission Permission) error {
+func verifyACL(acl ACL, access string, permission Permission, disableACL bool) error {
+	if disableACL {
+		// only the bucket owner should have access to the bucket
+		// as bucket ACLs are disabled and no grantee check is necessary
+		if acl.Owner != access {
+			return s3err.GetAPIError(s3err.ErrAccessDenied)
+		}
+
+		return nil
+	}
+
 	grantee := Grantee{
 		Access:     access,
 		Permission: permission,
@@ -492,4 +503,15 @@ func UpdateBucketACLOwner(ctx context.Context, be backend.Backend, bucket, newOw
 	}
 
 	return be.DeleteBucketPolicy(ctx, bucket)
+}
+
+// ValidateCannedACL validates bucket canned acl value
+func ValidateCannedACL(acl types.BucketCannedACL) error {
+	switch types.BucketCannedACL(acl) {
+	case types.BucketCannedACLPrivate, types.BucketCannedACLPublicRead, types.BucketCannedACLPublicReadWrite, "":
+		return nil
+	default:
+		debuglogger.Logf("invalid bucket canned acl: %v", acl)
+		return s3err.GetAPIError(s3err.ErrInvalidArgument)
+	}
 }

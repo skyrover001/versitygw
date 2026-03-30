@@ -18,13 +18,6 @@ load ./bats-support/load
 load ./bats-assert/load
 
 source ./tests/setup.sh
-source ./tests/util/util_create_bucket.sh
-source ./tests/util/util_file.sh
-source ./tests/util/util_lock_config.sh
-source ./tests/util/util_object.sh
-source ./tests/util/util_setup.sh
-source ./tests/util/util_tags.sh
-source ./tests/test_s3api_root_inner.sh
 source ./tests/test_common.sh
 source ./tests/test_common_acl.sh
 source ./tests/commands/copy_object.sh
@@ -50,6 +43,14 @@ source ./tests/commands/put_object_retention.sh
 source ./tests/commands/put_public_access_block.sh
 source ./tests/commands/select_object_content.sh
 source ./tests/drivers/copy_object/copy_object_rest.sh
+source ./tests/drivers/get_object_tagging/get_object_tagging.sh
+source ./tests/drivers/list_buckets/list_buckets_rest.sh
+source ./tests/drivers/put_bucket_ownership_controls/put_bucket_ownership_controls_rest.sh
+source ./tests/drivers/file.sh
+source ./tests/util/util_file.sh
+source ./tests/util/util_lock_config.sh
+source ./tests/util/util_object.sh
+source ./tests/test_s3api_root_inner.sh
 
 export RUN_USERS=true
 

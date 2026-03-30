@@ -17,6 +17,7 @@ package integration
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/md5"
 	"crypto/rand"
 	"crypto/sha1"
@@ -39,6 +40,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode"
 
@@ -47,11 +49,15 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
+	"github.com/aws/smithy-go/middleware"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/versity/versitygw/s3err"
+	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/semaphore"
 )
 
 var (
-	bcktCount        = 0
+	bcktCount        atomic.Uint64
 	adminErrorPrefix = "XAdmin"
 )
 
@@ -61,32 +67,17 @@ type user struct {
 	role   string
 }
 
-var (
-	testuser1 user = user{
-		access: "grt1",
-		secret: "grt1secret",
-		role:   "user",
-	}
-	testuser2 user = user{
-		access: "grt2",
-		secret: "grt2secret",
-		role:   "user",
-	}
-	testuserplus user = user{
-		access: "grtplus",
-		secret: "grt1plussecret",
-		role:   "userplus",
-	}
-	testadmin user = user{
-		access: "admin",
-		secret: "adminsecret",
-		role:   "admin",
-	}
-)
-
 func getBucketName() string {
-	bcktCount++
-	return fmt.Sprintf("test-bucket-%v", bcktCount)
+	val := bcktCount.Add(1)
+	return fmt.Sprintf("test-bucket-%v", val)
+}
+
+func getUser(role string) user {
+	return user{
+		access: fmt.Sprintf("test-user-%v", genRandString(16)),
+		secret: fmt.Sprintf("test-secret-%v", genRandString(16)),
+		role:   role,
+	}
 }
 
 func setup(s *S3Conf, bucket string, opts ...setupOpt) error {
@@ -129,17 +120,25 @@ func teardown(s *S3Conf, bucket string) error {
 	s3client := s.GetClient()
 
 	deleteObject := func(bucket, key, versionId *string) error {
-		ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
-		_, err := s3client.DeleteObject(ctx, &s3.DeleteObjectInput{
-			Bucket:    bucket,
-			Key:       key,
-			VersionId: versionId,
-		})
-		cancel()
-		if err != nil {
-			return fmt.Errorf("failed to delete object %v: %w", *key, err)
+		var attempts int
+		var err error
+		for attempts < maxRetryAttempts {
+			ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+			_, err = s3client.DeleteObject(ctx, &s3.DeleteObjectInput{
+				Bucket:    bucket,
+				Key:       key,
+				VersionId: versionId,
+			})
+			cancel()
+			if err == nil {
+				return nil
+			}
+
+			attempts++
+			time.Sleep(time.Second)
 		}
-		return nil
+
+		return fmt.Errorf("delete object %s: %w", *key, err)
 	}
 
 	if s.versioningEnabled {
@@ -277,7 +276,8 @@ func actionHandler(s *S3Conf, testName string, handler func(s3client *s3.Client,
 func actionHandlerNoSetup(s *S3Conf, testName string, handler func(s3client *s3.Client, bucket string) error, _ ...setupOpt) error {
 	runF(testName)
 	client := s.GetClient()
-	handlerErr := handler(client, "")
+	bucket := getBucketName()
+	handlerErr := handler(client, bucket)
 	if handlerErr != nil {
 		failF("%v: %v", testName, handlerErr)
 	}
@@ -296,11 +296,12 @@ type authConfig struct {
 	body     []byte
 	service  string
 	date     time.Time
+	headers  map[string]string
 }
 
 func authHandler(s *S3Conf, cfg *authConfig, handler func(req *http.Request) error) error {
 	runF(cfg.testName)
-	req, err := createSignedReq(cfg.method, s.endpoint, cfg.path, s.awsID, s.awsSecret, cfg.service, s.awsRegion, cfg.body, cfg.date, nil)
+	req, err := createSignedReq(cfg.method, s.endpoint, cfg.path, s.awsID, s.awsSecret, cfg.service, s.awsRegion, cfg.body, cfg.date, cfg.headers)
 	if err != nil {
 		failF("%v: %v", cfg.testName, err)
 		return fmt.Errorf("%v: %w", cfg.testName, err)
@@ -371,6 +372,8 @@ func checkHTTPResponseApiErr(resp *http.Response, apiErr s3err.APIError) error {
 		return err
 	}
 
+	resp.Body.Close()
+
 	var errResp s3err.APIErrorResponse
 	err = xml.Unmarshal(body, &errResp)
 	if err != nil {
@@ -380,11 +383,19 @@ func checkHTTPResponseApiErr(resp *http.Response, apiErr s3err.APIError) error {
 	if resp.StatusCode != apiErr.HTTPStatusCode {
 		return fmt.Errorf("expected response status code to be %v, instead got %v", apiErr.HTTPStatusCode, resp.StatusCode)
 	}
-	if errResp.Code != apiErr.Code {
-		return fmt.Errorf("expected error code to be %v, instead got %v", apiErr.Code, errResp.Code)
+	return compareS3ApiError(apiErr, &errResp)
+}
+
+func compareS3ApiError(expected s3err.APIError, received *s3err.APIErrorResponse) error {
+	if received == nil {
+		return fmt.Errorf("expected %w, received nil", expected)
 	}
-	if errResp.Message != apiErr.Description {
-		return fmt.Errorf("expected error message to be %v, instead got %v", apiErr.Description, errResp.Message)
+
+	if received.Code != expected.Code {
+		return fmt.Errorf("expected error code to be %v, instead got %v", expected.Code, received.Code)
+	}
+	if received.Message != expected.Description {
+		return fmt.Errorf("expected error message to be %v, instead got %v", expected.Description, received.Message)
 	}
 
 	return nil
@@ -481,6 +492,28 @@ func listObjects(client *s3.Client, bucket, prefix, delimiter string, maxKeys in
 	return contents, commonPrefixes, nil
 }
 
+func constructObjectLocation(endpoint, bucket, object string, hostStyle bool) string {
+	// Normalize endpoint (no trailing slash)
+	endpoint = strings.TrimRight(endpoint, "/")
+
+	if !hostStyle {
+		// Path-style: http://endpoint/bucket/object
+		return fmt.Sprintf("%s/%s/%s", endpoint, bucket, object)
+	}
+
+	// Host-style: http://bucket.endpoint/object
+	u, err := url.Parse(endpoint)
+	if err != nil || u.Host == "" {
+		// Fallback for raw host:port endpoints (e.g. "127.0.0.1:7070")
+		return fmt.Sprintf("http://%s.%s/%s", bucket, endpoint, object)
+	}
+
+	host := u.Host
+	u.Host = fmt.Sprintf("%s.%s", bucket, host)
+
+	return fmt.Sprintf("%s/%s", u.String(), object)
+}
+
 func hasObjNames(objs []types.Object, names []string) bool {
 	if len(objs) != len(names) {
 		return false
@@ -520,7 +553,7 @@ type putObjectOutput struct {
 func putObjectWithData(lgth int64, input *s3.PutObjectInput, client *s3.Client) (*putObjectOutput, error) {
 	var csum [32]byte
 	var data []byte
-	if input.Body == nil {
+	if input.Body == nil && lgth != 0 {
 		data = make([]byte, lgth)
 		rand.Read(data)
 		csum = sha256.Sum256(data)
@@ -528,8 +561,30 @@ func putObjectWithData(lgth int64, input *s3.PutObjectInput, client *s3.Client) 
 		input.Body = r
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
-	res, err := client.PutObject(ctx, input)
+	ctx, cancel := context.WithTimeout(context.Background(), longTimeout)
+	res, err := client.PutObject(ctx, input, func(o *s3.Options) {
+		// if input.Body is not nil, aws sdk hardcodes Content-Type: application/octet-stream
+		// this adds a new middleware in the stack to remove the Content-Type header, if
+		// it isn't explicitly provided as 'PutObject' input. Place the middleware
+		// right before "Signing" middleware to avoid incorrect request signature calculation
+		if input.ContentType == nil {
+			o.APIOptions = append(o.APIOptions, func(stack *middleware.Stack) error {
+				return stack.Finalize.Insert(
+					middleware.FinalizeMiddlewareFunc("UnsetContentType",
+						func(ctx context.Context, in middleware.FinalizeInput, next middleware.FinalizeHandler) (
+							out middleware.FinalizeOutput, md middleware.Metadata, err error,
+						) {
+							if req, ok := in.Request.(*smithyhttp.Request); ok {
+								req.Header.Del("Content-Type")
+							}
+							return next.HandleFinalize(ctx, in)
+						}),
+					"Signing",
+					middleware.Before,
+				)
+			})
+		}
+	})
 	cancel()
 	if err != nil {
 		return nil, err
@@ -545,6 +600,7 @@ func putObjectWithData(lgth int64, input *s3.PutObjectInput, client *s3.Client) 
 type mpCfg struct {
 	checksumAlgorithm types.ChecksumAlgorithm
 	checksumType      types.ChecksumType
+	metadata          map[string]string
 }
 
 type mpOpt func(*mpCfg)
@@ -554,6 +610,9 @@ func withChecksum(algo types.ChecksumAlgorithm) mpOpt {
 }
 func withChecksumType(t types.ChecksumType) mpOpt {
 	return func(mc *mpCfg) { mc.checksumType = t }
+}
+func withMetadata(m map[string]string) mpOpt {
+	return func(mc *mpCfg) { mc.metadata = m }
 }
 
 func createMp(s3client *s3.Client, bucket, key string, opts ...mpOpt) (*s3.CreateMultipartUploadOutput, error) {
@@ -567,6 +626,7 @@ func createMp(s3client *s3.Client, bucket, key string, opts ...mpOpt) (*s3.Creat
 		Key:               &key,
 		ChecksumAlgorithm: cfg.checksumAlgorithm,
 		ChecksumType:      cfg.checksumType,
+		Metadata:          cfg.metadata,
 	})
 	cancel()
 	return out, err
@@ -720,7 +780,7 @@ func areMapsSame(mp1, mp2 map[string]string) bool {
 		return false
 	}
 	for key, val := range mp2 {
-		if mp1[strings.ToLower(key)] != val {
+		if mp1[key] != val {
 			return false
 		}
 	}
@@ -802,14 +862,13 @@ func comparePrefixes(list1 []string, list2 []types.CommonPrefix) bool {
 		return false
 	}
 
-	elementMap := make(map[string]bool)
-
-	for _, elem := range list1 {
-		elementMap[elem] = true
-	}
-
-	for _, elem := range list2 {
-		if _, found := elementMap[*elem.Prefix]; !found {
+	for i, prefix := range list1 {
+		if list2[i].Prefix == nil {
+			fmt.Printf("unexpected nil prefix on index %v", i)
+			return false
+		}
+		if *list2[i].Prefix != prefix {
+			fmt.Printf("prefix mismatch on index %v: expected %s, got %v", i, prefix, *list2[i].Prefix)
 			return false
 		}
 	}
@@ -941,10 +1000,6 @@ func uploadParts(client *s3.Client, size, partCount int64, bucket, key, uploadId
 
 func createUsers(s *S3Conf, users []user) error {
 	for _, usr := range users {
-		err := deleteUser(s, usr.access)
-		if err != nil {
-			return err
-		}
 		out, err := execCommand(s.getAdminCommand("-a", s.awsID, "-s", s.awsSecret, "-er", s.endpoint, "create-user", "-a", usr.access, "-s", usr.secret, "-r", usr.role)...)
 		if err != nil {
 			return err
@@ -953,18 +1008,6 @@ func createUsers(s *S3Conf, users []user) error {
 			return fmt.Errorf("failed to create user account: %s", out)
 		}
 	}
-	return nil
-}
-
-func deleteUser(s *S3Conf, access string) error {
-	out, err := execCommand(s.getAdminCommand("-a", s.awsID, "-s", s.awsSecret, "-er", s.endpoint, "delete-user", "-a", access)...)
-	if err != nil {
-		return err
-	}
-	if strings.Contains(string(out), adminErrorPrefix) {
-		return fmt.Errorf("failed to delete the user account, %s", out)
-	}
-
 	return nil
 }
 
@@ -1062,8 +1105,7 @@ func grantPublicBucketPolicy(client *s3.Client, bucket string, tp policyType) er
 	case policyTypeObject:
 		doc = genPolicyDoc("Allow", `"*"`, `"s3:*"`, fmt.Sprintf(`"arn:aws:s3:::%s/*"`, bucket))
 	case policyTypeFull:
-		template := `
-		{
+		template := `{
 			"Statement": [
 				{
 					"Effect":  "Allow",
@@ -1099,25 +1141,6 @@ func getMalformedPolicyError(msg string) s3err.APIError {
 	}
 }
 
-// if true enables, otherwise disables
-func changeBucketObjectLockStatus(client *s3.Client, bucket string, status bool) error {
-	cfg := types.ObjectLockConfiguration{}
-	if status {
-		cfg.ObjectLockEnabled = types.ObjectLockEnabledEnabled
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
-	_, err := client.PutObjectLockConfiguration(ctx, &s3.PutObjectLockConfigurationInput{
-		Bucket:                  &bucket,
-		ObjectLockConfiguration: &cfg,
-	})
-	cancel()
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
 func putBucketVersioningStatus(client *s3.Client, bucket string, status types.BucketVersioningStatus) error {
 	ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
 	_, err := client.PutBucketVersioning(ctx, &s3.PutBucketVersioningInput{
@@ -1138,15 +1161,9 @@ func checkWORMProtection(client *s3.Client, bucket, object string) error {
 		Key:    &object,
 	})
 	cancel()
-	if err := checkSdkApiErr(err, "InvalidRequest"); err != nil {
+	if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrObjectLocked)); err != nil {
 		return err
 	}
-	// client sdk regression issue prevents getting full error message,
-	// change back to below once this is fixed:
-	// https://github.com/aws/aws-sdk-go-v2/issues/2921
-	// if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrObjectLocked)); err != nil {
-	// 	return err
-	// }
 
 	ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
 	_, err = client.DeleteObject(ctx, &s3.DeleteObjectInput{
@@ -1154,15 +1171,9 @@ func checkWORMProtection(client *s3.Client, bucket, object string) error {
 		Key:    &object,
 	})
 	cancel()
-	if err := checkSdkApiErr(err, "InvalidRequest"); err != nil {
+	if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrObjectLocked)); err != nil {
 		return err
 	}
-	// client sdk regression issue prevents getting full error message,
-	// change back to below once this is fixed:
-	// https://github.com/aws/aws-sdk-go-v2/issues/2921
-	// if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrObjectLocked)); err != nil {
-	// 	return err
-	// }
 
 	ctx, cancel = context.WithTimeout(context.Background(), shortTimeout)
 	_, err = client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
@@ -1176,15 +1187,9 @@ func checkWORMProtection(client *s3.Client, bucket, object string) error {
 		},
 	})
 	cancel()
-	if err := checkSdkApiErr(err, "InvalidRequest"); err != nil {
+	if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrObjectLocked)); err != nil {
 		return err
 	}
-	// client sdk regression issue prevents getting full error message,
-	// change back to below once this is fixed:
-	// https://github.com/aws/aws-sdk-go-v2/issues/2921
-	// if err := checkApiErr(err, s3err.GetAPIError(s3err.ErrObjectLocked)); err != nil {
-	// 	return err
-	// }
 
 	return nil
 }
@@ -1851,4 +1856,667 @@ func sprintVersions(objects []types.ObjectVersion) string {
 	}
 
 	return strings.Join(names, ",")
+}
+
+// objToDelete represents the metadata of an object that needs to be deleted.
+// It holds details like the key, version, and legal/compliance lock flags.
+type objToDelete struct {
+	key                string // Object key (name) in the bucket
+	versionId          string // Specific object version ID
+	removeLegalHold    bool   // Whether to remove legal hold before deletion
+	removeOnlyLeglHold bool   // Whether to only remove legal hold, without deletion
+	isCompliance       bool   // Whether the object is under Compliance mode retention
+}
+
+// Worker and retry configuration for deleting locked objects
+const (
+	maxDelObjWorkers int64         = 20              // Maximum number of concurrent delete workers
+	maxRetryAttempts int           = 3               // Maximum retries for object deletion
+	lockWaitTime     time.Duration = time.Second * 3 // Wait time for lock expiration before retrying delete
+)
+
+// cleanupLockedObjects removes objects from a bucket that may be protected by
+// Object Lock (legal hold or retention).
+// It handles both Governance and Compliance retention modes and retries deletions
+// when necessary.
+func cleanupLockedObjects(client *s3.Client, bucket string, objs []objToDelete) error {
+	eg, ctx := errgroup.WithContext(context.Background())
+
+	// Semaphore to limit the number of concurrent workers
+	sem := semaphore.NewWeighted(maxDelObjWorkers)
+
+	for _, obj := range objs {
+
+		// Acquire worker slot before processing an object
+		if err := sem.Acquire(ctx, 1); err != nil {
+			return fmt.Errorf("failed to acquire worker space: %w", err)
+		}
+
+		defer sem.Release(1)
+
+		eg.Go(func() error {
+			// Remove legal hold if required
+			if obj.removeLegalHold || obj.removeOnlyLeglHold {
+				ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+				_, err := client.PutObjectLegalHold(ctx, &s3.PutObjectLegalHoldInput{
+					Bucket:    &bucket,
+					Key:       &obj.key,
+					VersionId: getPtr(obj.versionId),
+					LegalHold: &types.ObjectLockLegalHold{
+						Status: types.ObjectLockLegalHoldStatusOff, // Disable legal hold
+					},
+				})
+				cancel()
+				// If object was already deleted, ignore the error
+				if errors.Is(err, s3err.GetAPIError(s3err.ErrNoSuchKey)) {
+					return nil
+				}
+				if err != nil {
+					return err
+				}
+
+				// If only the legal hold needs to be removed, stop here
+				if obj.removeOnlyLeglHold {
+					return nil
+				}
+			}
+
+			// Apply temporary retention policy to allow deletion
+			// RetainUntilDate is set a few seconds in the future to handle network delays
+			retDate := time.Now().Add(lockWaitTime)
+			mode := types.ObjectLockRetentionModeGovernance
+			if obj.isCompliance {
+				mode = types.ObjectLockRetentionModeCompliance
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+			_, err := client.PutObjectRetention(ctx, &s3.PutObjectRetentionInput{
+				Bucket:    &bucket,
+				Key:       &obj.key,
+				VersionId: getPtr(obj.versionId),
+				Retention: &types.ObjectLockRetention{
+					Mode:            mode,
+					RetainUntilDate: &retDate,
+				},
+			})
+			cancel()
+
+			// If object was already deleted, ignore the error
+			if errors.Is(err, s3err.GetAPIError(s3err.ErrNoSuchKey)) {
+				return nil
+			}
+
+			if err != nil {
+				return err
+			}
+
+			// Wait until retention lock expires before attempting delete
+			time.Sleep(lockWaitTime)
+
+			// Return last error if all retries failed
+			return nil
+		})
+	}
+
+	// Wait for all goroutines to finish, return any error encountered
+	return eg.Wait()
+}
+
+type objectLockMode string
+
+const (
+	objectLockModeLegalHold  = "legal-hold"
+	objectLockModeGovernance = "governance"
+	objectLockModeCompliance = "compliance"
+)
+
+func lockObject(client *s3.Client, mode objectLockMode, bucket, object, versionId string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+	defer cancel()
+	var m types.ObjectLockRetentionMode
+	switch mode {
+	case objectLockModeLegalHold:
+		_, err := client.PutObjectLegalHold(ctx, &s3.PutObjectLegalHoldInput{
+			Bucket:    &bucket,
+			Key:       &object,
+			VersionId: getPtr(versionId),
+			LegalHold: &types.ObjectLockLegalHold{
+				Status: types.ObjectLockLegalHoldStatusOn,
+			},
+		})
+		return err
+	case objectLockModeCompliance:
+		m = types.ObjectLockRetentionModeCompliance
+	case objectLockModeGovernance:
+		m = types.ObjectLockRetentionModeGovernance
+	default:
+		return fmt.Errorf("invalid object lock mode: %s", mode)
+	}
+
+	date := time.Now().Add(time.Hour * 3)
+	_, err := client.PutObjectRetention(ctx, &s3.PutObjectRetentionInput{
+		Bucket:    &bucket,
+		Key:       &object,
+		VersionId: getPtr(versionId),
+		Retention: &types.ObjectLockRetention{
+			Mode:            m,
+			RetainUntilDate: &date,
+		},
+	})
+	return err
+}
+
+func NewHasher(algo types.ChecksumAlgorithm) (hash.Hash, error) {
+	var hasher hash.Hash
+	switch algo {
+	case types.ChecksumAlgorithmSha256:
+		hasher = sha256.New()
+	case types.ChecksumAlgorithmSha1:
+		hasher = sha1.New()
+	case types.ChecksumAlgorithmCrc32:
+		hasher = crc32.NewIEEE()
+	case types.ChecksumAlgorithmCrc32c:
+		hasher = crc32.New(crc32.MakeTable(crc32.Castagnoli))
+	default:
+		return nil, fmt.Errorf("unsupported hash algorithm: %s", algo)
+	}
+
+	return hasher, nil
+}
+
+func processCompositeChecksum(hasher hash.Hash, checksum string) error {
+	data, err := base64.StdEncoding.DecodeString(checksum)
+	if err != nil {
+		return fmt.Errorf("base64 decode: %w", err)
+	}
+
+	_, err = hasher.Write(data)
+	if err != nil {
+		return fmt.Errorf("hash write: %w", err)
+	}
+
+	return nil
+}
+
+type mpinfo struct {
+	uploadId *string
+	parts    []types.CompletedPart
+}
+
+func putBucketPolicy(client *s3.Client, bucket, policy string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+	_, err := client.PutBucketPolicy(ctx, &s3.PutBucketPolicyInput{
+		Bucket: &bucket,
+		Policy: &policy,
+	})
+	cancel()
+	return err
+}
+
+func sendSignedRequest(s *S3Conf, req *http.Request, cancel context.CancelFunc) (map[string]string, *s3err.APIErrorResponse, error) {
+	signer := v4.NewSigner()
+	signErr := signer.SignHTTP(req.Context(), aws.Credentials{AccessKeyID: s.awsID, SecretAccessKey: s.awsSecret}, req, "STREAMING-UNSIGNED-PAYLOAD-TRAILER", "s3", s.awsRegion, time.Now())
+	if signErr != nil {
+		cancel()
+		return nil, nil, fmt.Errorf("failed to sign the request: %w", signErr)
+	}
+
+	resp, err := s.httpClient.Do(req)
+	cancel()
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to send the request: %w", err)
+	}
+
+	if resp.StatusCode >= 300 {
+		defer resp.Body.Close()
+		bodyBytes, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to read the request body: %w", err)
+		}
+
+		var errResp s3err.APIErrorResponse
+		err = xml.Unmarshal(bodyBytes, &errResp)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to unmarshal response body: %w", err)
+		}
+
+		return nil, &errResp, nil
+	}
+
+	headers := map[string]string{}
+	for key, val := range resp.Header {
+		headers[strings.ToLower(key)] = val[0]
+	}
+
+	return headers, nil, nil
+}
+
+func testUnsignedStreamingPayloadTrailerObjectPut(s *S3Conf, bucket, object string, body []byte, reqHeaders map[string]string) (map[string]string, *s3err.APIErrorResponse, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, s.endpoint+"/"+bucket+"/"+object, bytes.NewReader(body))
+	if err != nil {
+		cancel()
+		return nil, nil, fmt.Errorf("failed to create a request: %w", err)
+	}
+
+	req.Header.Add("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER")
+	for key, val := range reqHeaders {
+		req.Header.Add(key, val)
+	}
+
+	return sendSignedRequest(s, req, cancel)
+}
+
+func testUnsignedStreamingPayloadTrailerUploadPart(s *S3Conf, bucket, object string, uploadId *string, body []byte, reqHeaders map[string]string) (map[string]string, *s3err.APIErrorResponse, error) {
+	if uploadId == nil {
+		return nil, nil, fmt.Errorf("empty upload id")
+	}
+
+	uri := fmt.Sprintf("%s/%s/%s?uploadId=%s&partNumber=%v", s.endpoint, bucket, object, *uploadId, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, uri, bytes.NewReader(body))
+	if err != nil {
+		cancel()
+		return nil, nil, fmt.Errorf("failed to create a request: %w", err)
+	}
+
+	req.Header.Add("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER")
+	for key, val := range reqHeaders {
+		req.Header.Add(key, val)
+	}
+
+	return sendSignedRequest(s, req, cancel)
+}
+
+// constructUnsignedPaylod constructs an unsigned streaming upload payload
+// and returns the decoded content length and the payload
+func constructUnsignedPaylod(chunkSizes ...int64) (int64, []byte, error) {
+	var cLength int64
+	buffer := bytes.NewBuffer([]byte{})
+
+	for _, chunkSize := range chunkSizes {
+		cLength += chunkSize
+		_, err := buffer.WriteString(fmt.Sprintf("%x\r\n", chunkSize))
+		if err != nil {
+			return 0, nil, err
+		}
+		_, err = buffer.WriteString(strings.Repeat("a", int(chunkSize)))
+		if err != nil {
+			return 0, nil, err
+		}
+		_, err = buffer.WriteString("\r\n")
+		if err != nil {
+			return 0, nil, err
+		}
+	}
+
+	return cLength, buffer.Bytes(), nil
+}
+
+type signedReqCfg struct {
+	headers          map[string]string
+	chunkSize        int64
+	modifFrom        *int
+	modifTo          *int
+	modifPayload     []byte
+	trailingChecksum *string
+	isTrailer        bool
+}
+
+type signedReqOpt func(*signedReqCfg)
+
+func withCustomHeaders(h map[string]string) signedReqOpt {
+	return func(src *signedReqCfg) { src.headers = h }
+}
+
+func withChunkSize(s int64) signedReqOpt {
+	return func(src *signedReqCfg) { src.chunkSize = s }
+}
+
+func withModifyPayload(from int, to int, p []byte) signedReqOpt {
+	return func(src *signedReqCfg) {
+		src.modifPayload = p
+		src.modifFrom = &from
+		src.modifTo = &to
+	}
+}
+
+func withTrailingChecksum(checksum string) signedReqOpt {
+	return func(src *signedReqCfg) {
+		src.trailingChecksum = &checksum
+		src.isTrailer = true
+	}
+}
+
+func testSignedStreamingObjectPut(s *S3Conf, bucket, object string, payload []byte, opts ...signedReqOpt) (map[string]string, *s3err.APIErrorResponse, error) {
+	cfg := &signedReqCfg{
+		chunkSize: 8192, // minimal valid chunk size
+	}
+
+	for _, opt := range opts {
+		opt(cfg)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), shortTimeout)
+	// create a request with no body
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, fmt.Sprintf("%s/%s/%s", s.endpoint, bucket, object), nil)
+	if err != nil {
+		return nil, nil, cancelAndError(fmt.Errorf("failed to create a request: %w", err), cancel)
+	}
+
+	var payloadOffset int64
+	var trailerLength int
+
+	// any planned modification which is going to affect the
+	// Content-Length header value
+	if cfg.modifFrom != nil && cfg.modifTo != nil {
+		diff := len(cfg.modifPayload) - *cfg.modifTo + *cfg.modifFrom
+		payloadOffset = int64(diff)
+	}
+	if cfg.isTrailer {
+		trailerLength = len(*cfg.trailingChecksum)
+	}
+	// precalculated the Content-Length header to correctly sign the request
+	req.ContentLength = calculateSignedReqContentLength(int64(len(payload)), cfg.chunkSize, payloadOffset, cfg.isTrailer, int64(trailerLength))
+	sha256Header := "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
+	if cfg.isTrailer {
+		sha256Header = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER"
+	}
+	req.Header.Set("x-amz-decoded-content-length", fmt.Sprint(len(payload)))
+	req.Header.Set("x-amz-content-sha256", sha256Header)
+
+	// set custom request headers
+	for key, val := range cfg.headers {
+		req.Header.Set(key, val)
+	}
+
+	signer := v4.NewSigner()
+	signingTime := time.Now().UTC()
+
+	// sign the request
+	err = signer.SignHTTP(ctx, aws.Credentials{AccessKeyID: s.awsID, SecretAccessKey: s.awsSecret}, req, sha256Header, "s3", s.awsRegion, signingTime)
+	if err != nil {
+		return nil, nil, cancelAndError(fmt.Errorf("failed to sign the request: %w", err), cancel)
+	}
+
+	// extract the seed signature
+	seedSignature, err := extractSignature(req)
+	if err != nil {
+		return nil, nil, cancelAndError(fmt.Errorf("failed to extract seed signature: %w", err), cancel)
+	}
+
+	// initialize v4 stream signed
+	streamSigner := v4.NewStreamSigner(aws.Credentials{AccessKeyID: s.awsID, SecretAccessKey: s.awsSecret}, "s3", s.awsRegion, seedSignature)
+	// create the signed payload
+	body, err := constructSignedStreamingPayload(ctx, streamSigner, signingTime, payload, cfg.chunkSize, cfg.trailingChecksum, s.awsRegion, s.awsSecret)
+	if err != nil {
+		return nil, nil, cancelAndError(fmt.Errorf("failed to encode req body: %w", err), cancel)
+	}
+
+	// overwrite body bytes by configuration
+	if cfg.modifFrom != nil && cfg.modifTo != nil {
+		body, err = replaceRange(body, cfg.modifPayload, *cfg.modifFrom, *cfg.modifTo)
+		if err != nil {
+			return nil, nil, cancelAndError(fmt.Errorf("failed replace body bytes: %w", err), cancel)
+		}
+	}
+
+	// assign req.Body and req.GetBody for the http client
+	// to handle the request
+	req.Body = io.NopCloser(bytes.NewReader(body))
+	req.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(body)), nil
+	}
+
+	// send the request
+	resp, err := s.httpClient.Do(req)
+	cancel()
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to send the request: %w", err)
+	}
+
+	if resp.StatusCode >= 300 {
+		defer resp.Body.Close()
+		bodyBytes, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to read the response body: %w", err)
+		}
+
+		var errResp s3err.APIErrorResponse
+		err = xml.Unmarshal(bodyBytes, &errResp)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to unmarshal response body: %w", err)
+		}
+		return nil, &errResp, nil
+	}
+
+	headers := map[string]string{}
+	for key, val := range resp.Header {
+		headers[strings.ToLower(key)] = val[0]
+	}
+
+	return headers, nil, nil
+}
+
+func cancelAndError(err error, cancel context.CancelFunc) error {
+	cancel()
+	return err
+}
+
+const (
+	chunkSigHdrLength int64 = 81
+	trailerSigLength  int64 = 88
+)
+
+// calculateSignedReqContentLength calculates the value of `Content-Length` header
+// sizeOffset marks any planned changes on the body, which will affect the size
+func calculateSignedReqContentLength(decPayloadSize int64, chunkSize int64, sizeOffset int64, withTrailer bool, trailerLength int64) int64 {
+	payloadSize := decPayloadSize
+	var chunkHeadersLength int64
+
+	if withTrailer {
+		chunkHeadersLength += trailerLength + 4 + trailerSigLength
+	}
+
+	// special case when chunk size is greater or equal than decoded content length
+	if chunkSize >= decPayloadSize {
+		chSizeLgth := len(fmt.Sprintf("%x", decPayloadSize))
+		return decPayloadSize + sizeOffset + int64(chSizeLgth) + 2*chunkSigHdrLength + 9 + chunkHeadersLength
+	}
+
+	for {
+		if payloadSize == 0 {
+			chunkHeadersLength += chunkSigHdrLength + 5
+			break
+		}
+		if payloadSize < chunkSize {
+			chunkHeadersLength += 2*chunkSigHdrLength + 9 + int64(len(fmt.Sprintf("%x", payloadSize)))
+			break
+		}
+		chSizeLgth := len(fmt.Sprintf("%x", chunkSize))
+		chunkHeadersLength += int64(chSizeLgth) + chunkSigHdrLength + 4
+
+		payloadSize -= chunkSize
+	}
+
+	return chunkHeadersLength + decPayloadSize + sizeOffset
+}
+
+// constructSignedStreamingPayload creates chunk encoded payload with signatures.
+func constructSignedStreamingPayload(ctx context.Context, signer *v4.StreamSigner, signingTime time.Time, payload []byte, chunkSize int64, trailer *string, region, secret string) ([]byte, error) {
+	buf := bytes.NewBuffer(nil)
+	payloadLen := int64(len(payload))
+
+	if chunkSize > payloadLen {
+		chunkSize = payloadLen
+	}
+
+	for i := int64(0); i < payloadLen; i += chunkSize {
+		if i+chunkSize > payloadLen {
+			offset := payloadLen - i
+			sig, err := signer.GetSignature(ctx, nil, payload[i:i+offset], signingTime)
+			if err != nil {
+				return nil, err
+			}
+
+			_, err = buf.WriteString(fmt.Sprintf("%x;chunk-signature=%x\r\n%s\r\n", offset, sig, payload[i:i+offset]))
+			if err != nil {
+				return nil, err
+			}
+			break
+		}
+
+		sig, err := signer.GetSignature(ctx, nil, payload[i:i+chunkSize], signingTime)
+		if err != nil {
+			return nil, err
+		}
+
+		_, err = buf.WriteString(fmt.Sprintf("%x;chunk-signature=%x\r\n%s\r\n", chunkSize, sig, payload[i:i+chunkSize]))
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	sig, err := signer.GetSignature(ctx, nil, nil, signingTime)
+	if err != nil {
+		return nil, err
+	}
+
+	if trailer != nil {
+		_, err = buf.WriteString(fmt.Sprintf("0;chunk-signature=%x\r\n", sig))
+		if err != nil {
+			return nil, err
+		}
+
+		sigKey := getSigningKey(secret, signingTime.Format("20060102"), region)
+		trailerSig, err := getAWS4StreamingTrailer(sigKey, sig, signingTime, region, *trailer)
+		if err != nil {
+			return nil, err
+		}
+
+		_, err = buf.WriteString(fmt.Sprintf("%s\r\nx-amz-trailer-signature:%s\r\n\r\n", *trailer, trailerSig))
+		if err != nil {
+			return nil, err
+		}
+
+		return buf.Bytes(), nil
+	}
+
+	_, err = buf.WriteString(fmt.Sprintf("0;chunk-signature=%x\r\n\r\n", sig))
+	if err != nil {
+		return nil, err
+	}
+
+	return buf.Bytes(), nil
+}
+
+// extractSignature extracts the signature from Authorization header
+func extractSignature(req *http.Request) ([]byte, error) {
+	const key = "Signature="
+
+	authHdr := req.Header.Get("Authorization")
+
+	_, after, ok := strings.Cut(authHdr, key)
+	if !ok {
+		return nil, errors.New("signature not found")
+	}
+
+	sig := after
+
+	return hex.DecodeString(sig)
+}
+
+// replaceRange replaces dst[start:end] with src and returns the modified slice.
+// Used for custom overwrite of request payload bytes.
+func replaceRange(dst, src []byte, start, end int) ([]byte, error) {
+	if start < 0 || end < start || end > len(dst) {
+		return nil, fmt.Errorf("invalid start/end indexes")
+	}
+
+	newLen := len(dst) - (end - start) + len(src)
+
+	// Fast path: reuse dst capacity if possible
+	if cap(dst) >= newLen {
+		// Extend or shrink dst
+		dst = dst[:newLen]
+
+		// Move the tail if sizes differ
+		copy(dst[start+len(src):], dst[end:])
+
+		// Copy replacement
+		copy(dst[start:], src)
+		return dst, nil
+	}
+
+	// Fallback: allocate new slice
+	out := make([]byte, newLen)
+	copy(out, dst[:start])
+	copy(out[start:], src)
+	copy(out[start+len(src):], dst[end:])
+	return out, nil
+}
+
+func getAWS4StreamingTrailer(
+	signingKey,
+	lastSignature []byte,
+	signingTime time.Time,
+	awsRegion,
+	trailer string,
+) (string, error) {
+
+	// yyyyMMdd
+	yearMonthDay := signingTime.Format("20060102")
+
+	// ISO8601 basic format: yyyyMMdd'T'HHmmss'Z'
+	currentDateTime := signingTime.Format("20060102T150405Z")
+
+	// <date>/<region>/<service>/aws4_request
+	serviceString := fmt.Sprintf(
+		"%s/%s/s3/aws4_request",
+		yearMonthDay,
+		awsRegion,
+	)
+
+	// Trailer must be newline-terminated for hashing/signing
+	trailerWithNL := trailer + "\n"
+
+	// Hash of trailer
+	trailerHash := sha256.Sum256([]byte(trailerWithNL))
+	trailerHashHex := hex.EncodeToString(trailerHash[:])
+
+	// String-to-sign prefix
+	stringToSignPrefix := fmt.Sprintf(
+		"%s\n%s\n%s",
+		"AWS4-HMAC-SHA256-TRAILER",
+		currentDateTime,
+		serviceString,
+	)
+
+	// Full string-to-sign
+	stringToSign := fmt.Sprintf(
+		"%s\n%x\n%s",
+		stringToSignPrefix,
+		lastSignature,
+		trailerHashHex,
+	)
+
+	// Final trailer signature
+	finalSignature := hex.EncodeToString(
+		hmacSHA256(signingKey, stringToSign),
+	)
+
+	return finalSignature, nil
+}
+
+func hmacSHA256(key []byte, data string) []byte {
+	h := hmac.New(sha256.New, key)
+	h.Write([]byte(data))
+	return h.Sum(nil)
+}
+
+func getSigningKey(secret, yearMonthDay, region string) []byte {
+	dateKey := hmacSHA256([]byte("AWS4"+secret), yearMonthDay)
+	dateRegionKey := hmacSHA256(dateKey, region)
+	dateRegionServiceKey := hmacSHA256(dateRegionKey, "s3")
+	return hmacSHA256(dateRegionServiceKey, "aws4_request")
 }

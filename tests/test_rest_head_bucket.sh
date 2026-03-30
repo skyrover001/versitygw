@@ -18,33 +18,56 @@ load ./bats-support/load
 load ./bats-assert/load
 
 source ./tests/setup.sh
+source ./tests/drivers/create_bucket/create_bucket_rest.sh
 
 @test "REST - HeadBucket - mismatched owner" {
-  if [ "$DIRECT" != "true" ]; then
-      skip "https://github.com/versity/versitygw/issues/1428"
-    fi
-  run setup_bucket "$BUCKET_ONE_NAME"
+  run get_bucket_name "$BUCKET_ONE_NAME"
+  assert_success
+  bucket_name="$output"
+
+  run setup_bucket "$bucket_name"
   assert_success
 
-  run head_bucket_rest_expect_error "$BUCKET_ONE_NAME" "EXPECTED_OWNER=012345678901" "403" "Forbidden"
+  run head_bucket_rest_expect_error "$bucket_name" "EXPECTED_OWNER=012345678901" "403" "Forbidden"
   assert_success
 }
 
 @test "REST - HeadBucket - invalid owner" {
-  if [ "$DIRECT" != "true" ]; then
-      skip "https://github.com/versity/versitygw/issues/1428"
-    fi
-  run setup_bucket "$BUCKET_ONE_NAME"
+  run get_bucket_name "$BUCKET_ONE_NAME"
+  assert_success
+  bucket_name="$output"
+
+  run setup_bucket "$bucket_name"
   assert_success
 
-  run head_bucket_rest_expect_error "$BUCKET_ONE_NAME" "EXPECTED_OWNER=01234567890" "400" "Bad Request"
+  if [ "$DIRECT" == "true" ]; then
+    http_code=400
+    error_code="Bad Request"
+  else
+    http_code=403
+    error_code="Forbidden"
+  fi
+  run head_bucket_rest_expect_error "$bucket_name" "EXPECTED_OWNER=01234567890" "$http_code" "$error_code"
   assert_success
 }
 
+@test "REST - HeadBucket - doesn't exist" {
+  run head_bucket_rest "$BUCKET_ONE_NAME-$(uuidgen)"
+  assert_failure 1
+}
+
 @test "REST - HeadBucket - expected owner success" {
-  run setup_bucket "$BUCKET_ONE_NAME"
+  run get_bucket_name "$BUCKET_ONE_NAME"
+  assert_success
+  bucket_name="$output"
+
+  run setup_bucket "$bucket_name"
   assert_success
 
-  run head_bucket_rest_expect_success "$BUCKET_ONE_NAME" "EXPECTED_OWNER=$AWS_USER_ID"
+  run get_user_id
+  assert_success
+  user_id=$output
+
+  run head_bucket_rest_expect_success "$bucket_name" "EXPECTED_OWNER=$user_id"
   assert_success
 }

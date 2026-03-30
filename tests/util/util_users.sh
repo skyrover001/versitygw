@@ -242,7 +242,7 @@ create_user_with_user() {
     log 2 "create user with user command requires creator ID, key, and new user ID, key, and role"
     return 1
   fi
-  if ! error=$(send_command "$VERSITY_EXE" admin --allow-insecure --access "$1" --secret "$2" --endpoint-url "$AWS_ENDPOINT_URL" create-user --access "$3" --secret "$4" --role "$5" 2>&1); then
+  if ! error=$(send_command "$VERSITY_EXE" admin --allow-insecure --access "$1" --secret "$2" --region "$AWS_REGION" --endpoint-url "$AWS_ENDPOINT_URL" create-user --access "$3" --secret "$4" --role "$5" 2>&1); then
     log 2 "error creating user: $error"
     return 1
   fi
@@ -287,7 +287,7 @@ list_users() {
 
 list_users_versitygw() {
   log 6 "list_users_versitygw"
-  users=$(send_command "$VERSITY_EXE" admin --allow-insecure --access "$AWS_ACCESS_KEY_ID" --secret "$AWS_SECRET_ACCESS_KEY" --endpoint-url "$AWS_ENDPOINT_URL" list-users 2>&1) || local list_result=$?
+  users=$(send_command "$VERSITY_EXE" admin --allow-insecure --access "$AWS_ACCESS_KEY_ID" --region "$AWS_REGION" --secret "$AWS_SECRET_ACCESS_KEY" --endpoint-url "$AWS_ENDPOINT_URL" list-users 2>&1) || local list_result=$?
   if [[ $list_result -ne 0 ]]; then
     log 2 "error listing users: $users"
     return 1
@@ -362,8 +362,7 @@ delete_user_versitygw() {
     log 2 "delete user via versitygw command requires user ID or username"
     return 1
   fi
-  log 5 "$VERSITY_EXE admin --allow-insecure --access $AWS_ACCESS_KEY_ID --secret $AWS_SECRET_ACCESS_KEY --endpoint-url $AWS_ENDPOINT_URL delete-user --access $1"
-  if ! error=$(send_command "$VERSITY_EXE" admin --allow-insecure --access "$AWS_ACCESS_KEY_ID" --secret "$AWS_SECRET_ACCESS_KEY" --endpoint-url "$AWS_ENDPOINT_URL" delete-user --access "$1" 2>&1); then
+  if ! error=$(send_command "$VERSITY_EXE" admin --allow-insecure --access "$AWS_ACCESS_KEY_ID" --secret "$AWS_SECRET_ACCESS_KEY" --region "$AWS_REGION" --endpoint-url "$AWS_ENDPOINT_URL" delete-user --access "$1" 2>&1); then
     log 2 "error deleting user: $error"
     export error
     return 1
@@ -391,15 +390,6 @@ delete_user() {
   fi
 }
 
-change_bucket_owner_direct() {
-  log 6 "change_bucket_owner_direct"
-  if [[ $# -ne 4 ]]; then
-    log 2 "change bucket owner command requires ID, key, bucket name, and new owner"
-    return 1
-  fi
-  # TODO add
-}
-
 reset_bucket_owner() {
   if [ $# -ne 1 ]; then
     log 2 "'reset_bucket_owner' requires bucket name"
@@ -419,14 +409,10 @@ change_bucket_owner() {
     return 1
   fi
   if [[ $DIRECT == "true" ]]; then
-    if ! change_bucket_owner_direct "$1" "$2" "$3" "$4"; then
-      log 2 "error changing bucket owner direct to s3"
-      return 1
-    fi
-    return 0
+    skip "any direct commands requiring bucket ownership change not yet implemented"
   fi
   log 5 "changing owner for bucket $3, new owner: $4"
-  error=$(send_command "$VERSITY_EXE" admin --allow-insecure --access "$1" --secret "$2" --endpoint-url "$AWS_ENDPOINT_URL" change-bucket-owner --bucket "$3" --owner "$4" 2>&1) || local change_result=$?
+  error=$(send_command "$VERSITY_EXE" admin --allow-insecure --access "$1" --secret "$2" --region "$AWS_REGION" --endpoint-url "$AWS_ENDPOINT_URL" change-bucket-owner --bucket "$3" --owner "$4" 2>&1) || local change_result=$?
   if [[ $change_result -ne 0 ]]; then
     log 2 "error changing bucket owner: $error"
     return 1
@@ -440,7 +426,7 @@ get_bucket_owner() {
     log 2 "'get bucket owner' command requires bucket name"
     return 1
   fi
-  if ! buckets=$(send_command "$VERSITY_EXE" admin --allow-insecure --access "$AWS_ACCESS_KEY_ID" --secret "$AWS_SECRET_ACCESS_KEY" --endpoint-url "$AWS_ENDPOINT_URL" list-buckets 2>&1); then
+  if ! buckets=$(send_command "$VERSITY_EXE" admin --allow-insecure --access "$AWS_ACCESS_KEY_ID" --secret "$AWS_SECRET_ACCESS_KEY" --region "$AWS_REGION" --endpoint-url "$AWS_ENDPOINT_URL" list-buckets 2>&1); then
     log 2 "error listing buckets: $buckets"
     return 1
   fi

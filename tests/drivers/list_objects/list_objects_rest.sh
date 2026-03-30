@@ -51,3 +51,115 @@ list_objects_success_or_access_denied() {
   fi
   return 0
 }
+
+check_v2_objects() {
+  if ! check_param_count_v2 "data file" 1 $#; then
+    return 1
+  fi
+  if ! check_xml_element "$1" "$object_count" "ListBucketResult" "KeyCount"; then
+    log 2 "error checking KeyCount element"
+    return 1
+  fi
+  for object in "${expected_objects[@]}"; do
+    if ! check_if_element_exists "$1" "$object" "ListBucketResult" "Contents" "Key"; then
+      log 2 "error checking if element '$object' exists"
+      return 1
+    fi
+  done
+  return 0
+}
+
+list_check_objects_rest_v2() {
+  if ! check_param_count_v2 "bucket name, object count, objects, params" 4 $#; then
+    return 1
+  fi
+  object_count=$2
+  expected_objects=("${@:3:$object_count}")
+  if ! list_objects_v2_rest_callback "$1" "200" "check_v2_objects" "${@:((3+$object_count))}"; then
+    log 2 "error sending list objects v2 command and checking callback"
+    return 1
+  fi
+}
+
+check_single_common_prefix_or_key() {
+  if ! check_param_count_v2 "data file, parameter, prefix or not" 3 $#; then
+    return 1
+  fi
+  if [ "$3" == "true" ]; then
+    if ! check_if_element_exists "$1" "$2" "ListBucketResult" "CommonPrefixes" "Prefix"; then
+      log 2 "error checking if CommonPrefix '$2' exists"
+      return 1
+    fi
+  else
+    if ! check_if_element_exists "$1" "$2" "ListBucketResult" "Contents" "Key"; then
+      log 2 "error checking if Key '$2' exists"
+      return 1
+    fi
+  fi
+  return 0
+}
+
+check_common_prefixes_and_keys() {
+  if ! check_param_count_gt "data file, prefix, delimiter, common prefixes, --, keys" 4 $#; then
+    return 1
+  fi
+  if ! xml_data=$(check_validity_and_or_parse_xml_data "$1" 2>&1); then
+    log 2 "error parsing xml data: $xml_data"
+    return 1
+  fi
+  local checking_prefixes="true" prefix_count=0 key_count=0
+  for param in "${@:4}"; do
+    if [ "$param" == "--" ]; then
+      checking_prefixes=false
+      continue
+    fi
+    if ! check_single_common_prefix_or_key "$xml_data" "$param" "$checking_prefixes"; then
+      log 2 "error checking if common prefix or key '$param' exists"
+      return 1
+    fi
+    if [ "$checking_prefixes" == "true" ]; then
+      ((prefix_count++))
+    else
+      ((key_count++))
+    fi
+  done
+  if ! check_prefix_delimiter_and_counts "$xml_data" "$2" "$3" "$prefix_count" "$key_count"; then
+    log 2 "error checking prefix"
+    return 1
+  fi
+  return 0
+}
+
+check_prefix_delimiter_and_counts() {
+  if ! check_param_count_v2 "data, prefix, delimiter, prefix count, key count" 5 $#; then
+    return 1
+  fi
+  if ! check_xml_element "$1" "$2" "ListBucketResult" "Prefix"; then
+    log 2 "error checking prefix"
+    return 1
+  fi
+  if ! check_xml_element "$1" "$3" "ListBucketResult" "Delimiter"; then
+    log 2 "error checking delimiter"
+    return 1
+  fi
+  if ! check_element_count "$1" "$4" "ListBucketResult" "CommonPrefixes" "Prefix"; then
+    log 2 "Prefix count mismatch"
+    return 1
+  fi
+  if ! check_element_count "$1" "$5" "ListBucketResult" "Contents" "Key"; then
+    log 2 "Prefix count mismatch"
+    return 1
+  fi
+  return 0
+}
+
+list_objects_with_prefix_and_delimiter_check_results() {
+  if ! check_param_count_gt "bucket name, prefix, delimiter, expected common prefixes, --, expected keys" 5 $#; then
+    return 1
+  fi
+  if ! send_rest_go_command_callback "200" "check_common_prefixes_and_keys" "-bucketName" "$1" "-query" "delimiter=$3&prefix=$2" "--" "${@:2}"; then
+    log 2 "error sending command to list objects or receiving response"
+    return 1
+  fi
+  return 0
+}

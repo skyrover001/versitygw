@@ -23,28 +23,6 @@ check_if_versioning_enabled() {
   return 1
 }
 
-parse_version_data_by_type() {
-  if ! check_param_count "parse_version_data_by_type" "client, data" 2 $#; then
-    return 1
-  fi
-  if [ "$1" == "rest" ]; then
-    log 5 "version data: $versions"
-    if ! parse_versions_rest "$versions"; then
-      log 2 "error parsing REST object versions"
-      return 1
-    fi
-  else
-    if ! parse_version_data "$versions" '.Versions[]'; then
-      log 2 "error parsing Versions elements"
-      return 1
-    fi
-    if ! parse_version_data "$versions" '.DeleteMarkers[]'; then
-      log 2 "error getting DeleteMarkers elements"
-      return 1
-    fi
-  fi
-}
-
 parse_version_data() {
   if ! check_param_count "parse_version_data" "raw data, element name" 2 $#; then
     return 1
@@ -74,7 +52,7 @@ check_versioning_status_rest() {
   if ! check_param_count "check_versioning_status_rest" "bucket, expected value" 2 $#; then
     return 1
   fi
-  if ! get_bucket_versioning_rest "$BUCKET_ONE_NAME"; then
+  if ! get_bucket_versioning_rest "$1"; then
     log 2 "error getting bucket versioning"
     return 1
   fi
@@ -102,10 +80,10 @@ check_versioning_status_rest() {
 }
 
 echo_versions() {
-  if ! check_param_count "echo_versions" "'Version' or 'DeleteMarker', 'Key' or 'VersionId'" 2 $#; then
+  if ! check_param_count_v2 "'Version' or 'DeleteMarker', 'Key' or 'VersionId' or 'IsLatest', file" 3 $#; then
     return 1
   fi
-  if ! keys=$(echo -n "$versions" | xmllint --xpath "//*[local-name()=\"$1\"]/*[local-name()=\"$2\"]/text()" - | xmlstarlet unesc 2>&1); then
+  if ! keys=$(xmllint --xpath "//*[local-name()=\"$1\"]/*[local-name()=\"$2\"]/text()" "$3" | xmlstarlet unesc 2>&1); then
     if [[ "$keys" == *"XPath set is empty"* ]]; then
       return 0
     fi
@@ -116,36 +94,82 @@ echo_versions() {
   echo "${keys[*]}"
 }
 
-parse_versions_rest() {
-  if ! check_param_count "parse_versions_rest" "versions variable" 1 $#; then
+get_base64_version_keys_and_ids() {
+  if ! check_param_count_v2 "'Version' or 'DeleteMarker'" 1 $#; then
     return 1
   fi
-  if ! keys=$(echo_versions "Version" "Key"); then
+  while IFS= read -r key && IFS= read -r vid; do
+    log 5 "key: $key, vid: $vid"
+    b_key="$(printf '%s' "$key" | base64 -w0)"
+    b_vid="$(printf '%s' "$vid" | base64 -w0)"
+    base64_pairs+=("$b_key:$b_vid")
+  done < <(xmlstarlet sel -t \
+               -m '//*[local-name()='"\"$1\""']' \
+               -v '*[local-name()="Key"]' -n \
+               -v '*[local-name()="VersionId"]' -n \
+               <<<"$versions" | xmlstarlet unesc)
+}
+
+parse_base64_versions_rest() {
+  base64_pairs=()
+  if ! get_base64_version_keys_and_ids "Version"; then
+    log 2 "error getting version base64 keys and IDs"
+    return 1
+  fi
+  if ! get_base64_version_keys_and_ids "DeleteMarker"; then
+    log 2 "error getting version base64 keys and IDs"
+    return 1
+  fi
+}
+
+parse_versions_rest() {
+  if ! check_param_count_v2 "data file" 1 $#; then
+    return 1
+  fi
+  log 5 "versions file: $(cat "$1")"
+  base64_pairs=()
+  version_keys=()
+  version_ids=()
+  version_islatests=()
+  if ! keys=$(echo_versions "Version" "Key" "$1"); then
     log 2 "error getting Version Key values: $keys"
     return 1
   fi
   # shellcheck disable=SC2206
   version_keys+=($keys)
-  if ! ids=$(echo_versions "Version" "VersionId"); then
+  if ! ids=$(echo_versions "Version" "VersionId" "$1"); then
     log 2 "error getting Version VersionId values: $ids"
     return 1
   fi
   # shellcheck disable=SC2206
   version_ids+=($ids)
-  if ! keys=$(echo_versions "DeleteMarker" "Key"); then
+  if ! is_latest=$(echo_versions "Version" "IsLatest" "$1"); then
+    log 2 "error getting Version IsLatest values: $is_latest"
+    return 1
+  fi
+  # shellcheck disable=SC2206
+  version_islatests+=($is_latest)
+  if ! keys=$(echo_versions "DeleteMarker" "Key" "$1"); then
     log 2 "error getting DeleteMarker Key values: $keys"
     return 1
   fi
   # shellcheck disable=SC2206
   version_keys+=($keys)
-  if ! ids=$(echo_versions "DeleteMarker" "VersionId"); then
+  if ! ids=$(echo_versions "DeleteMarker" "VersionId" "$1"); then
     log 2 "error getting DeleteMarker VersionId values: $ids"
     return 1
   fi
   # shellcheck disable=SC2206
   version_ids+=($ids)
+  if ! is_latest=$(echo_versions "DeleteMarker" "IsLatest" "$1"); then
+    log 2 "error getting DeleteMarker IsLatest values: $is_latest"
+    return 1
+  fi
+  # shellcheck disable=SC2206
+  version_islatests+=($is_latest)
   log 5 "version keys: ${version_keys[*]}"
   log 5 "version IDs: ${version_ids[*]}"
+  log 5 "base64 pairs: ${base64_pairs[*]}"
   return 0
 }
 

@@ -29,7 +29,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
-	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
@@ -205,11 +205,12 @@ func (s *IAMServiceS3) ListUserAccounts() ([]Account, error) {
 	var accs []Account
 	for _, k := range keys {
 		accs = append(accs, Account{
-			Access:  k,
-			Secret:  conf.AccessAccounts[k].Secret,
-			Role:    conf.AccessAccounts[k].Role,
-			UserID:  conf.AccessAccounts[k].UserID,
-			GroupID: conf.AccessAccounts[k].GroupID,
+			Access:    k,
+			Secret:    conf.AccessAccounts[k].Secret,
+			Role:      conf.AccessAccounts[k].Role,
+			UserID:    conf.AccessAccounts[k].UserID,
+			GroupID:   conf.AccessAccounts[k].GroupID,
+			ProjectID: conf.AccessAccounts[k].ProjectID,
 		})
 	}
 
@@ -289,13 +290,13 @@ func (s *IAMServiceS3) storeAccts(conf iAMConfig) error {
 	}
 
 	obj := iamFile
-	uploader := manager.NewUploader(s.client)
-	upinfo := &s3.PutObjectInput{
+	uploader := transfermanager.New(s.client)
+	upinfo := &transfermanager.UploadObjectInput{
 		Body:   bytes.NewReader(b),
 		Bucket: &s.bucket,
 		Key:    &obj,
 	}
-	_, err = uploader.Upload(context.Background(), upinfo)
+	_, err = uploader.UploadObject(context.Background(), upinfo)
 	if err != nil {
 		return fmt.Errorf("store accounts in %v: %w", iamFile, err)
 	}

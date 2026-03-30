@@ -1,0 +1,53 @@
+name: Release Helm Chart
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Check if chart should be updated
+        id: check
+        run: |
+          version=$(yq '.version' chart/Chart.yaml)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if helm show chart oci://ghcr.io/versity/versitygw/charts/versitygw --version "$version" 2>/dev/null; then
+            echo "No chart update detected."
+            echo "new=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Chart update detected. Updating to $version."
+            echo "new=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Package chart
+        if: steps.check.outputs.new == 'true'
+        run: helm package chart/
+
+      - name: Login to GHCR
+        if: steps.check.outputs.new == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: versity
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push chart
+        if: steps.check.outputs.new == 'true'
+        run: helm push versitygw-${{ steps.check.outputs.version }}.tgz oci://ghcr.io/versity/versitygw/charts
+
+      - name: Install cosign
+        if: steps.check.outputs.new == 'true'
+        uses: sigstore/cosign-installer@v4.1.0
+
+      - name: Sign chart with cosign
+        if: steps.check.outputs.new == 'true'
+        run: cosign sign --yes ghcr.io/versity/versitygw/charts/versitygw:${{ steps.check.outputs.version }}

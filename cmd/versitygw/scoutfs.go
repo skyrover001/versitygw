@@ -26,6 +26,7 @@ import (
 var (
 	glacier          bool
 	disableNoArchive bool
+	setProjectID     bool
 )
 
 func scoutfsCommand() *cli.Command {
@@ -67,6 +68,12 @@ move interfaces as well as support for tiered filesystems.`,
 				Destination: &chowngid,
 			},
 			&cli.BoolFlag{
+				Name:        "projectid",
+				Usage:       "set project id on newly created buckets, files, and directories to client account ProjectID",
+				EnvVars:     []string{"VGW_SET_PROJECT_ID"},
+				Destination: &setProjectID,
+			},
+			&cli.BoolFlag{
 				Name:        "bucketlinks",
 				Usage:       "allow symlinked directories at bucket level to be treated as buckets",
 				EnvVars:     []string{"VGW_BUCKET_LINKS"},
@@ -92,6 +99,13 @@ move interfaces as well as support for tiered filesystems.`,
 				EnvVars:     []string{"VGW_DISABLE_NOARCHIVE"},
 				Destination: &disableNoArchive,
 			},
+			&cli.IntFlag{
+				Name:        "concurrency",
+				Usage:       "maximum concurrent actions allowed",
+				EnvVars:     []string{"VGW_POSIX_CONCURRENCY"},
+				Value:       5000,
+				Destination: &actionsConcurrency,
+			},
 		},
 	}
 }
@@ -105,6 +119,10 @@ func runScoutfs(ctx *cli.Context) error {
 		return fmt.Errorf("invalid directory permissions: %d", dirPerms)
 	}
 
+	if actionsConcurrency <= 0 {
+		return fmt.Errorf("concurrency must be positive, got %d", actionsConcurrency)
+	}
+
 	var opts scoutfs.ScoutfsOpts
 	opts.GlacierMode = glacier
 	opts.ChownUID = chownuid
@@ -113,6 +131,9 @@ func runScoutfs(ctx *cli.Context) error {
 	opts.NewDirPerm = fs.FileMode(dirPerms)
 	opts.DisableNoArchive = disableNoArchive
 	opts.VersioningDir = versioningDir
+	opts.ValidateBucketNames = disableStrictBucketNames
+	opts.SetProjectID = setProjectID
+	opts.Concurrency = actionsConcurrency
 
 	be, err := scoutfs.New(ctx.Args().Get(0), opts)
 	if err != nil {

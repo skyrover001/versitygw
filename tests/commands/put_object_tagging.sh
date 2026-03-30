@@ -14,14 +14,14 @@
 # specific language governing permissions and limitations
 # under the License.
 
+source ./tests/util/util_rest.sh
+
 put_object_tagging() {
-  if [ $# -ne 5 ]; then
-    log 2 "'put-object-tagging' command missing command type, bucket, object name, file, key, and/or value"
+  if ! check_param_count_v2 "command type, bucket, object key, tag key, value" 5 $#; then
     return 1
   fi
   local error
   local result
-  record_command "put-object-tagging" "client:$1"
   if [[ $1 == 's3api' ]]; then
     error=$(send_command aws --no-verify-ssl s3api put-object-tagging --bucket "$2" --key "$3" --tagging "TagSet=[{Key=$4,Value=$5}]" 2>&1) || result=$?
   elif [[ $1 == 'mc' ]]; then
@@ -60,15 +60,17 @@ put_object_tagging_rest() {
   current_date_time=$(date -u +"%Y%m%dT%H%M%SZ")
   aws_endpoint_url_address=${AWS_ENDPOINT_URL#*//}
   header=$(echo "$AWS_ENDPOINT_URL" | awk -F: '{print $1}')
+  content_md5=$(echo -n "$tagging" | openssl dgst -binary -md5 | openssl base64)
   # shellcheck disable=SC2154
   canonical_request="PUT
 /$1/$2
 tagging=
+content-md5:$content_md5
 host:$aws_endpoint_url_address
 x-amz-content-sha256:$payload_hash
 x-amz-date:$current_date_time
 
-host;x-amz-content-sha256;x-amz-date
+content-md5;host;x-amz-content-sha256;x-amz-date
 $payload_hash"
 
   if ! generate_sts_string "$current_date_time" "$canonical_request"; then
@@ -78,7 +80,8 @@ $payload_hash"
   get_signature
   # shellcheck disable=SC2154
   reply=$(send_command curl -ks -w "%{http_code}" -X PUT "$header://$aws_endpoint_url_address/$1/$2?tagging" \
-    -H "Authorization: AWS4-HMAC-SHA256 Credential=$AWS_ACCESS_KEY_ID/$ymd/$AWS_REGION/s3/aws4_request,SignedHeaders=host;x-amz-content-sha256;x-amz-date,Signature=$signature" \
+    -H "Authorization: AWS4-HMAC-SHA256 Credential=$AWS_ACCESS_KEY_ID/$ymd/$AWS_REGION/s3/aws4_request,SignedHeaders=content-md5;host;x-amz-content-sha256;x-amz-date,Signature=$signature" \
+    -H "Content-MD5: $content_md5" \
     -H "x-amz-content-sha256: $payload_hash" \
     -H "x-amz-date: $current_date_time" \
     -d "$tagging" -o "$TEST_FILE_FOLDER"/put_tagging_error.txt 2>&1)

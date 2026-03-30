@@ -18,9 +18,10 @@ load ./bats-support/load
 load ./bats-assert/load
 
 source ./tests/test_user_common.sh
-source ./tests/util/util_setup.sh
 source ./tests/commands/get_object.sh
 source ./tests/commands/put_object.sh
+source ./tests/drivers/put_bucket_ownership_controls/put_bucket_ownership_controls_rest.sh
+source ./tests/drivers/file.sh
 source ./tests/drivers/user.sh
 
 export RUN_USERS=true
@@ -35,7 +36,7 @@ export RUN_USERS=true
 
 @test "test_delete_user_no_access_key" {
   if [ "$SKIP_USERS_TESTS" == "true" ]; then
-    skip
+    skip "skipping versitygw-specific users tests"
   fi
   run delete_user ""
   assert_failure
@@ -51,7 +52,7 @@ export RUN_USERS=true
 
 @test "test_user_get_object" {
   if [ "$SKIP_USERS_TESTS" == "true" ]; then
-    skip
+    skip "skipping versitygw-specific users tests"
   fi
   test_file="test_file"
 
@@ -78,7 +79,7 @@ export RUN_USERS=true
 
 @test "test_userplus_get_object" {
   if [ "$SKIP_USERS_TESTS" == "true" ]; then
-    skip
+    skip "skipping versitygw-specific users tests"
   fi
   test_file="test_file"
 
@@ -105,7 +106,7 @@ export RUN_USERS=true
 
 @test "test_user_delete_object" {
   if [ "$SKIP_USERS_TESTS" == "true" ]; then
-    skip
+    skip "skipping versitygw-specific users tests"
   fi
   test_file="test_file"
 
@@ -132,7 +133,7 @@ export RUN_USERS=true
 
 @test "test_admin_put_get_object" {
   if [ "$SKIP_USERS_TESTS" == "true" ]; then
-    skip
+    skip "skipping versitygw-specific users tests"
   fi
   test_file="test_file"
 
@@ -163,7 +164,7 @@ export RUN_USERS=true
 
 @test "test_user_create_multipart_upload" {
   if [ "$SKIP_USERS_TESTS" == "true" ]; then
-    skip
+    skip "skipping versitygw-specific users tests"
   fi
   test_file="test_file"
 

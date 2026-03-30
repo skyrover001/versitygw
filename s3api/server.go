@@ -15,38 +15,51 @@
 package s3api
 
 import (
-	"crypto/tls"
+	"errors"
+	"fmt"
+	"net"
 	"net/http"
+	"strings"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/logger"
+	"github.com/gofiber/fiber/v2/middleware/recover"
 	"github.com/versity/versitygw/auth"
 	"github.com/versity/versitygw/backend"
 	"github.com/versity/versitygw/debuglogger"
 	"github.com/versity/versitygw/metrics"
 	"github.com/versity/versitygw/s3api/controllers"
 	"github.com/versity/versitygw/s3api/middlewares"
+	"github.com/versity/versitygw/s3api/utils"
+	"github.com/versity/versitygw/s3err"
 	"github.com/versity/versitygw/s3event"
 	"github.com/versity/versitygw/s3log"
+	"github.com/versity/versitygw/webui"
+)
+
+const (
+	shutDownDuration = time.Second * 10
 )
 
 type S3ApiServer struct {
-	app           *fiber.App
-	backend       backend.Backend
-	router        *S3ApiRouter
-	port          string
-	cert          *tls.Certificate
-	quiet         bool
-	readonly      bool
-	health        string
-	virtualDomain string
+	Router           *S3ApiRouter
+	app              *fiber.App
+	backend          backend.Backend
+	CertStorage      *utils.CertStorage
+	quiet            bool
+	keepAlive        bool
+	health           string
+	maxConnections   int
+	maxRequests      int
+	webuiMountPrefix string
+	webuiSrvCfg      *webui.ServerConfig
 }
 
 func New(
-	app *fiber.App,
 	be backend.Backend,
 	root middlewares.RootUserConfig,
-	port, region string,
+	region string,
 	iam auth.IAMService,
 	l s3log.AuditLogger,
 	adminLogger s3log.AuditLogger,
@@ -55,20 +68,52 @@ func New(
 	opts ...Option,
 ) (*S3ApiServer, error) {
 	server := &S3ApiServer{
-		app:     app,
 		backend: be,
-		router:  new(S3ApiRouter),
-		port:    port,
+		Router: &S3ApiRouter{
+			be:      be,
+			iam:     iam,
+			logger:  l,
+			aLogger: adminLogger,
+			evs:     evs,
+			mm:      mm,
+			root:    root,
+			region:  region,
+		},
 	}
 
 	for _, opt := range opts {
 		opt(server)
 	}
 
+	app := fiber.New(fiber.Config{
+		AppName:               "versitygw",
+		ServerHeader:          "VERSITYGW",
+		StreamRequestBody:     true,
+		DisableKeepalive:      !server.keepAlive,
+		Network:               fiber.NetworkTCP,
+		DisableStartupMessage: true,
+		ErrorHandler:          globalErrorHandler,
+		Concurrency:           server.maxConnections,
+		// Sets buffer limit to read/parse incoming requests
+		// if the limit is reached, fiber/fasthttp will throw an error
+		// in the global error handler
+		ReadBufferSize: 8 * 1024, // 8 KB
+	})
+
+	server.app = app
+	server.Router.app = app
+
+	// initialize the panic recovery middleware
+	app.Use(recover.New(
+		recover.Config{
+			EnableStackTrace:  true,
+			StackTraceHandler: stackTraceHandler,
+		}))
+
 	// Logging middlewares
 	if !server.quiet {
 		app.Use(logger.New(logger.Config{
-			Format: "${time} | ${status} | ${latency} | ${ip} | ${method} | ${path} | ${error} | ${queryParams}\n",
+			Format: "${time} | vgw | ${status} | ${latency} | ${ip} | ${method} | ${path} | ${error} | ${queryParams}\n",
 		}))
 	}
 	// Set up health endpoint if specified
@@ -78,6 +123,14 @@ func New(
 		})
 	}
 
+	// Set up WebUI on the S3 port if configured
+	if server.webuiSrvCfg != nil {
+		webui.MountOn(app, server.webuiMountPrefix, server.webuiSrvCfg)
+	}
+
+	// initialize total requests cap limiter middleware
+	app.Use(middlewares.RateLimiter(server.maxRequests, mm, l))
+
 	// initilaze the default value setter middleware
 	app.Use(middlewares.SetDefaultValues(root, region))
 
@@ -85,17 +138,12 @@ func New(
 	// path unescapes the url
 	app.Use(controllers.WrapMiddleware(middlewares.DecodeURL, l, mm))
 
-	// initialize host-style parser in virtual domain is specified
-	if server.virtualDomain != "" {
-		app.Use(middlewares.HostStyleParser(server.virtualDomain))
-	}
-
 	// initialize the debug logger in debug mode
 	if debuglogger.IsDebugEnabled() {
 		app.Use(middlewares.DebugLogger())
 	}
 
-	server.router.Init(app, be, iam, l, adminLogger, evs, mm, server.readonly, region, root)
+	server.Router.Init()
 
 	return server, nil
 }
@@ -104,13 +152,13 @@ func New(
 type Option func(*S3ApiServer)
 
 // WithTLS sets TLS Credentials
-func WithTLS(cert tls.Certificate) Option {
-	return func(s *S3ApiServer) { s.cert = &cert }
+func WithTLS(cs *utils.CertStorage) Option {
+	return func(s *S3ApiServer) { s.CertStorage = cs }
 }
 
 // WithAdminServer runs admin endpoints with the gateway in the same network
 func WithAdminServer() Option {
-	return func(s *S3ApiServer) { s.router.WithAdmSrv = true }
+	return func(s *S3ApiServer) { s.Router.WithAdmSrv = true }
 }
 
 // WithQuiet silences default logging output
@@ -124,17 +172,141 @@ func WithHealth(health string) Option {
 }
 
 func WithReadOnly() Option {
-	return func(s *S3ApiServer) { s.readonly = true }
+	return func(s *S3ApiServer) { s.Router.readonly = true }
 }
 
 // WithHostStyle enabled host-style bucket addressing on the server
 func WithHostStyle(virtualDomain string) Option {
-	return func(s *S3ApiServer) { s.virtualDomain = virtualDomain }
+	return func(s *S3ApiServer) {
+		s.Router.virtualDomain = virtualDomain
+	}
 }
 
-func (sa *S3ApiServer) Serve() (err error) {
-	if sa.cert != nil {
-		return sa.app.ListenTLSWithCertificate(sa.port, *sa.cert)
+// WithKeepAlive enables the server keep alive
+func WithKeepAlive() Option {
+	return func(s *S3ApiServer) { s.keepAlive = true }
+}
+
+// WithCORSAllowOrigin sets the default CORS Access-Control-Allow-Origin value.
+// This is applied when no bucket CORS configuration exists, and for admin APIs.
+func WithCORSAllowOrigin(origin string) Option {
+	return func(s *S3ApiServer) { s.Router.corsAllowOrigin = origin }
+}
+
+// WithWebUI mounts the WebUI on the S3 server's Fiber app at the given path prefix,
+// before S3 routes are registered. The prefix must start with "/" and must not be
+// empty or just "/".
+func WithWebUI(prefix string, cfg *webui.ServerConfig) Option {
+	return func(s *S3ApiServer) {
+		s.webuiMountPrefix = prefix
+		s.webuiSrvCfg = cfg
 	}
-	return sa.app.Listen(sa.port)
+}
+
+// WithConcurrencyLimiter sets the server's maximum connection limit
+// and the hard limit for in-flight requests.
+func WithConcurrencyLimiter(maxConnections, maxRequests int) Option {
+	return func(s *S3ApiServer) {
+		s.maxConnections = maxConnections
+		s.maxRequests = maxRequests
+	}
+}
+
+// WithDisableACL disables the s3 api server ACLs, by ignoring all
+// bucket/object ACL headers
+func WithDisableACL() Option {
+	return func(s *S3ApiServer) { s.Router.disableACL = true }
+}
+
+// ServeMultiPort creates listeners for multiple port specifications and serves
+// on all of them simultaneously. This supports listening on multiple ports and/or
+// addresses (e.g., [":7070", "localhost:8080", "0.0.0.0:9090"]).
+func (sa *S3ApiServer) ServeMultiPort(ports []string) error {
+	if len(ports) == 0 {
+		return fmt.Errorf("no ports specified")
+	}
+
+	// Multiple ports - create listeners for each
+	var listeners []net.Listener
+
+	for _, portSpec := range ports {
+		var ln net.Listener
+		var err error
+
+		if sa.CertStorage != nil {
+			ln, err = utils.NewMultiAddrTLSListener(sa.app.Config().Network, portSpec, sa.CertStorage.GetCertificate)
+		} else {
+			ln, err = utils.NewMultiAddrListener(sa.app.Config().Network, portSpec)
+		}
+		if err != nil {
+			return fmt.Errorf("failed to bind s3 listener %s: %w", portSpec, err)
+		}
+
+		listeners = append(listeners, ln)
+	}
+
+	if len(listeners) == 0 {
+		return fmt.Errorf("failed to create any s3 listeners")
+	}
+
+	// Combine all listeners
+	finalListener := utils.NewMultiListener(listeners...)
+
+	return sa.app.Listener(finalListener)
+}
+
+// ShutDown gracefully shuts down the server with a context timeout
+func (sa *S3ApiServer) ShutDown() error {
+	return sa.app.ShutdownWithTimeout(shutDownDuration)
+}
+
+// stackTraceHandler stores the system panics
+// in the context locals
+func stackTraceHandler(ctx *fiber.Ctx, e any) {
+	utils.ContextKeyStack.Set(ctx, e)
+}
+
+// globalErrorHandler catches the errors before reaching to
+// the handlers and any system panics
+func globalErrorHandler(ctx *fiber.Ctx, er error) error {
+	// set content type to application/xml
+	ctx.Response().Header.SetContentType(fiber.MIMEApplicationXML)
+
+	if utils.ContextKeyStack.IsSet(ctx) {
+		// if stack is set, it means the stack trace
+		// has caught a panic
+		// log it as a panic log
+		debuglogger.Panic(er)
+	} else {
+		// handle the fiber specific errors
+		var fiberErr *fiber.Error
+		if errors.As(er, &fiberErr) {
+			if errors.Is(fiberErr, fiber.ErrRequestHeaderFieldsTooLarge) {
+				debuglogger.Logf("total request headers size exceeds the allowed 8KB")
+				ctx.Status(http.StatusBadRequest)
+				return nil
+			}
+			if strings.Contains(fiberErr.Message, "cannot parse Content-Length") {
+				debuglogger.Logf("failed to parse Content-Length")
+				ctx.Status(http.StatusBadRequest)
+				return nil
+			}
+			if strings.Contains(fiberErr.Message, "error when reading request headers") {
+				// This error means fiber failed to parse the incoming request
+				// which is a malfoedmed one. Return a BadRequest in this case
+				debuglogger.Logf("failed to parse the http request")
+				err := s3err.GetAPIError(s3err.ErrCannotParseHTTPRequest)
+				ctx.Status(err.HTTPStatusCode)
+				return ctx.Send(s3err.GetAPIErrorResponse(err, "", "", ""))
+			}
+		}
+
+		// additionally log the internal error
+		debuglogger.InternalError(er)
+	}
+
+	ctx.Status(http.StatusInternalServerError)
+
+	return ctx.Send(s3err.GetAPIErrorResponse(
+		s3err.GetAPIError(s3err.ErrInternalError), "", "", ""))
 }

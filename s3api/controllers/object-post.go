@@ -50,6 +50,7 @@ func (c S3ApiController) RestoreObject(ctx *fiber.Ctx) (*Response, error) {
 			Object:          key,
 			Action:          auth.RestoreObjectAction,
 			IsPublicRequest: isBucketPublic,
+			DisableACL:      c.disableACL,
 		})
 	if err != nil {
 		return &Response{
@@ -101,6 +102,7 @@ func (c S3ApiController) SelectObjectContent(ctx *fiber.Ctx) (*Response, error) 
 			Object:          key,
 			Action:          auth.GetObjectAction,
 			IsPublicRequest: isBucketPublic,
+			DisableACL:      c.disableACL,
 		})
 	if err != nil {
 		return &Response{
@@ -145,14 +147,13 @@ func (c S3ApiController) SelectObjectContent(ctx *fiber.Ctx) (*Response, error) 
 func (c S3ApiController) CreateMultipartUpload(ctx *fiber.Ctx) (*Response, error) {
 	bucket := ctx.Params("bucket")
 	key := strings.TrimPrefix(ctx.Path(), fmt.Sprintf("/%s/", bucket))
-	contentType := ctx.Get("Content-Type")
+	contentType := ctx.Get("Content-Type", defaultContentType)
 	contentDisposition := ctx.Get("Content-Disposition")
 	contentLanguage := ctx.Get("Content-Language")
 	cacheControl := ctx.Get("Cache-Control")
 	contentEncoding := ctx.Get("Content-Encoding")
 	tagging := ctx.Get("X-Amz-Tagging")
 	expires := ctx.Get("Expires")
-	metadata := utils.GetUserMetaData(&ctx.Request().Header)
 	// context locals
 	acct := utils.ContextKeyAccount.Get(ctx).(auth.Account)
 	isRoot := utils.ContextKeyIsRoot.Get(ctx).(bool)
@@ -168,7 +169,17 @@ func (c S3ApiController) CreateMultipartUpload(ctx *fiber.Ctx) (*Response, error
 			Bucket:        bucket,
 			Object:        key,
 			Action:        auth.PutObjectAction,
+			DisableACL:    c.disableACL,
 		})
+	if err != nil {
+		return &Response{
+			MetaOpts: &MetaOptions{
+				BucketOwner: parsedAcl.Owner,
+			},
+		}, err
+	}
+
+	metadata, err := utils.GetUserMetaData(&ctx.Request().Header)
 	if err != nil {
 		return &Response{
 			MetaOpts: &MetaOptions{
@@ -252,6 +263,7 @@ func (c S3ApiController) CompleteMultipartUpload(ctx *fiber.Ctx) (*Response, err
 			Object:          key,
 			Action:          auth.PutObjectAction,
 			IsPublicRequest: isBucketPublic,
+			DisableACL:      c.disableACL,
 		})
 	if err != nil {
 		return &Response{
@@ -278,7 +290,7 @@ func (c S3ApiController) CompleteMultipartUpload(ctx *fiber.Ctx) (*Response, err
 			MetaOpts: &MetaOptions{
 				BucketOwner: parsedAcl.Owner,
 			},
-		}, s3err.GetAPIError(s3err.ErrEmptyParts)
+		}, s3err.GetAPIError(s3err.ErrMalformedXML)
 	}
 
 	var mpuObjectSize *int64
@@ -305,7 +317,7 @@ func (c S3ApiController) CompleteMultipartUpload(ctx *fiber.Ctx) (*Response, err
 		mpuObjectSize = &val
 	}
 
-	checksums, err := utils.ParseChecksumHeaders(ctx)
+	checksums, err := utils.ParseCompleteMpChecksumHeaders(ctx)
 	if err != nil {
 		return &Response{
 			MetaOpts: &MetaOptions{
@@ -325,6 +337,15 @@ func (c S3ApiController) CompleteMultipartUpload(ctx *fiber.Ctx) (*Response, err
 
 	ifMatch, ifNoneMatch := utils.ParsePreconditionMatchHeaders(ctx)
 
+	err = auth.CheckObjectAccess(ctx.Context(), bucket, acct.Access, []types.ObjectIdentifier{{Key: &key}}, true, isBucketPublic, c.be, true)
+	if err != nil {
+		return &Response{
+			MetaOpts: &MetaOptions{
+				BucketOwner: parsedAcl.Owner,
+			},
+		}, err
+	}
+
 	res, versid, err := c.be.CompleteMultipartUpload(ctx.Context(),
 		&s3.CompleteMultipartUploadInput{
 			Bucket:   &bucket,
@@ -343,6 +364,10 @@ func (c S3ApiController) CompleteMultipartUpload(ctx *fiber.Ctx) (*Response, err
 			IfMatch:           ifMatch,
 			IfNoneMatch:       ifNoneMatch,
 		})
+	if err == nil {
+		objUrl := utils.GenerateObjectLocation(ctx, c.virtualDomain, bucket, key)
+		res.Location = &objUrl
+	}
 	return &Response{
 		Data: res,
 		Headers: map[string]*string{

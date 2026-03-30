@@ -15,7 +15,6 @@
 package controllers
 
 import (
-	"bytes"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -48,6 +47,7 @@ func (c S3ApiController) PutBucketTagging(ctx *fiber.Ctx) (*Response, error) {
 		Bucket:          bucket,
 		Action:          auth.PutBucketTaggingAction,
 		IsPublicRequest: isPublicBucket,
+		DisableACL:      c.disableACL,
 	})
 	if err != nil {
 		return &Response{
@@ -89,6 +89,7 @@ func (c S3ApiController) PutBucketOwnershipControls(ctx *fiber.Ctx) (*Response, 
 		Acc:           acct,
 		Bucket:        bucket,
 		Action:        auth.PutBucketOwnershipControlsAction,
+		DisableACL:    c.disableACL,
 	}); err != nil {
 		return &Response{
 			MetaOpts: &MetaOptions{
@@ -144,6 +145,7 @@ func (c S3ApiController) PutBucketVersioning(ctx *fiber.Ctx) (*Response, error) 
 		Bucket:          bucket,
 		Action:          auth.PutBucketVersioningAction,
 		IsPublicRequest: isPublicBucket,
+		DisableACL:      c.disableACL,
 	})
 	if err != nil {
 		return &Response{
@@ -198,6 +200,7 @@ func (c S3ApiController) PutObjectLockConfiguration(ctx *fiber.Ctx) (*Response, 
 		Bucket:          bucket,
 		Action:          auth.PutBucketObjectLockConfigurationAction,
 		IsPublicRequest: isPublicBucket,
+		DisableACL:      c.disableACL,
 	}); err != nil {
 		return &Response{
 			MetaOpts: &MetaOptions{
@@ -239,6 +242,7 @@ func (c S3ApiController) PutBucketCors(ctx *fiber.Ctx) (*Response, error) {
 		Bucket:          bucket,
 		Action:          auth.PutBucketCorsAction,
 		IsPublicRequest: isPublicBucket,
+		DisableACL:      c.disableACL,
 	})
 	if err != nil {
 		return &Response{
@@ -271,37 +275,6 @@ func (c S3ApiController) PutBucketCors(ctx *fiber.Ctx) (*Response, error) {
 		}, err
 	}
 
-	algo, checksusms, err := utils.ParseChecksumHeadersAndSdkAlgo(ctx)
-	if err != nil {
-		return &Response{
-			MetaOpts: &MetaOptions{
-				BucketOwner: parsedAcl.Owner,
-			},
-		}, err
-	}
-
-	if algo != "" {
-		rdr, err := utils.NewHashReader(bytes.NewReader(body), checksusms[algo], utils.HashType(strings.ToLower(string(algo))))
-		if err != nil {
-			return &Response{
-				MetaOpts: &MetaOptions{
-					BucketOwner: parsedAcl.Owner,
-				},
-			}, err
-		}
-
-		// Pass the same body to avoid data duplication
-		_, err = rdr.Read(body)
-		if err != nil {
-			debuglogger.Logf("failed to read hash calculation data: %v", err)
-			return &Response{
-				MetaOpts: &MetaOptions{
-					BucketOwner: parsedAcl.Owner,
-				},
-			}, err
-		}
-	}
-
 	err = c.be.PutBucketCors(ctx.Context(), bucket, body)
 	return &Response{
 		MetaOpts: &MetaOptions{
@@ -324,6 +297,7 @@ func (c S3ApiController) PutBucketPolicy(ctx *fiber.Ctx) (*Response, error) {
 		Acc:           acct,
 		Bucket:        bucket,
 		Action:        auth.PutBucketPolicyAction,
+		DisableACL:    c.disableACL,
 	})
 	if err != nil {
 		return &Response{
@@ -346,13 +320,14 @@ func (c S3ApiController) PutBucketPolicy(ctx *fiber.Ctx) (*Response, error) {
 	return &Response{
 		MetaOpts: &MetaOptions{
 			BucketOwner: parsedAcl.Owner,
+			Status:      http.StatusNoContent,
 		},
 	}, err
 }
 
 func (c S3ApiController) PutBucketAcl(ctx *fiber.Ctx) (*Response, error) {
 	bucket := ctx.Params("bucket")
-	acl := ctx.Get("X-Amz-Acl")
+	acl := types.BucketCannedACL(ctx.Get("X-Amz-Acl"))
 	grantFullControl := ctx.Get("X-Amz-Grant-Full-Control")
 	grantRead := ctx.Get("X-Amz-Grant-Read")
 	grantReadACP := ctx.Get("X-Amz-Grant-Read-Acp")
@@ -375,7 +350,26 @@ func (c S3ApiController) PutBucketAcl(ctx *fiber.Ctx) (*Response, error) {
 			Acc:           acct,
 			Bucket:        bucket,
 			Action:        auth.PutBucketAclAction,
+			DisableACL:    c.disableACL,
 		})
+	if err != nil {
+		return &Response{
+			MetaOpts: &MetaOptions{
+				BucketOwner: parsedAcl.Owner,
+			},
+		}, err
+	}
+
+	if c.disableACL {
+		debuglogger.Logf("PutBucketAcl is not available, as ACLs are disabled at gateway level")
+		return &Response{
+			MetaOpts: &MetaOptions{
+				BucketOwner: parsedAcl.Owner,
+			},
+		}, s3err.GetAPIError(s3err.ErrACLsDisabled)
+	}
+
+	err = auth.ValidateCannedACL(acl)
 	if err != nil {
 		return &Response{
 			MetaOpts: &MetaOptions{
@@ -436,7 +430,7 @@ func (c S3ApiController) PutBucketAcl(ctx *fiber.Ctx) (*Response, error) {
 				}
 		}
 
-		if grants+acl != "" {
+		if grants+string(acl) != "" {
 			debuglogger.Logf("invalid request: %q (grants) %q (acl)",
 				grants, acl)
 			return &Response{
@@ -451,14 +445,6 @@ func (c S3ApiController) PutBucketAcl(ctx *fiber.Ctx) (*Response, error) {
 			AccessControlPolicy: &accessControlPolicy,
 		}
 	} else if acl != "" {
-		if acl != "private" && acl != "public-read" && acl != "public-read-write" {
-			debuglogger.Logf("invalid acl: %q", acl)
-			return &Response{
-				MetaOpts: &MetaOptions{
-					BucketOwner: parsedAcl.Owner,
-				},
-			}, s3err.GetAPIError(s3err.ErrInvalidRequest)
-		}
 		if grants != "" {
 			debuglogger.Logf("invalid request: %q (grants) %q (acl)",
 				grants, acl)
@@ -491,7 +477,7 @@ func (c S3ApiController) PutBucketAcl(ctx *fiber.Ctx) (*Response, error) {
 		}, s3err.GetAPIError(s3err.ErrMissingSecurityHeader)
 	}
 
-	updAcl, err := auth.UpdateACL(input, parsedAcl, c.iam, acct.Role == auth.RoleAdmin)
+	updAcl, err := auth.UpdateACL(input, parsedAcl, c.iam)
 	if err != nil {
 		return &Response{
 			MetaOpts: &MetaOptions{
@@ -510,20 +496,29 @@ func (c S3ApiController) PutBucketAcl(ctx *fiber.Ctx) (*Response, error) {
 
 func (c S3ApiController) CreateBucket(ctx *fiber.Ctx) (*Response, error) {
 	bucket := ctx.Params("bucket")
-	acl := ctx.Get("X-Amz-Acl")
-	grantFullControl := ctx.Get("X-Amz-Grant-Full-Control")
-	grantRead := ctx.Get("X-Amz-Grant-Read")
-	grantReadACP := ctx.Get("X-Amz-Grant-Read-Acp")
-	grantWrite := ctx.Get("X-Amz-Grant-Write")
-	grantWriteACP := ctx.Get("X-Amz-Grant-Write-Acp")
+	acl := types.BucketCannedACL(c.getAclHeaderValue(ctx, "X-Amz-Acl"))
+	grantFullControl := c.getAclHeaderValue(ctx, "X-Amz-Grant-Full-Control")
+	grantRead := c.getAclHeaderValue(ctx, "X-Amz-Grant-Read")
+	grantReadACP := c.getAclHeaderValue(ctx, "X-Amz-Grant-Read-Acp")
+	grantWrite := c.getAclHeaderValue(ctx, "X-Amz-Grant-Write")
+	grantWriteACP := c.getAclHeaderValue(ctx, "X-Amz-Grant-Write-Acp")
 	lockEnabled := strings.EqualFold(ctx.Get("X-Amz-Bucket-Object-Lock-Enabled"), "true")
-	acct := utils.ContextKeyAccount.Get(ctx).(auth.Account)
 	grants := grantFullControl + grantRead + grantReadACP + grantWrite + grantWriteACP
-	objectOwnership := types.ObjectOwnership(
-		ctx.Get("X-Amz-Object-Ownership", string(types.ObjectOwnershipBucketOwnerEnforced)),
-	)
+	objectOwnership := types.ObjectOwnership(ctx.Get("X-Amz-Object-Ownership"))
 
-	if acct.Role != auth.RoleAdmin && acct.Role != auth.RoleUserPlus {
+	if c.readonly {
+		return &Response{
+			MetaOpts: &MetaOptions{},
+		}, s3err.GetAPIError(s3err.ErrAccessDenied)
+	}
+
+	creator := utils.ContextKeyAccount.Get(ctx).(auth.Account)
+	if !utils.ContextKeyBucketOwner.IsSet(ctx) {
+		utils.ContextKeyBucketOwner.Set(ctx, creator)
+	}
+	bucketOwner := utils.ContextKeyBucketOwner.Get(ctx).(auth.Account)
+
+	if creator.Role != auth.RoleAdmin && creator.Role != auth.RoleUserPlus {
 		return &Response{
 			MetaOpts: &MetaOptions{},
 		}, s3err.GetAPIError(s3err.ErrAccessDenied)
@@ -532,14 +527,48 @@ func (c S3ApiController) CreateBucket(ctx *fiber.Ctx) (*Response, error) {
 	// validate the bucket name
 	if ok := utils.IsValidBucketName(bucket); !ok {
 		return &Response{
-			MetaOpts: &MetaOptions{},
+			MetaOpts: &MetaOptions{
+				BucketOwner: bucketOwner.Access,
+			},
 		}, s3err.GetAPIError(s3err.ErrInvalidBucketName)
+	}
+
+	// both bucket canned ACL and acl grants is not allowed
+	if acl != "" && grants != "" {
+		debuglogger.Logf("invalid request: %q (grants) %q (acl)", grants, acl)
+		return &Response{
+			MetaOpts: &MetaOptions{
+				BucketOwner: bucketOwner.Access,
+			},
+		}, s3err.GetAPIError(s3err.ErrBothCannedAndHeaderGrants)
+	}
+
+	// validate bucket canned acl
+	err := auth.ValidateCannedACL(acl)
+	if err != nil {
+		return &Response{
+			MetaOpts: &MetaOptions{
+				BucketOwner: bucketOwner.Access,
+			},
+		}, err
+	}
+
+	// if bucket acl is 'private', object ownership should default to 'BucketOwnerPreferred'
+	if acl == types.BucketCannedACLPrivate && objectOwnership == "" {
+		objectOwnership = types.ObjectOwnershipBucketOwnerPreferred
+	}
+
+	// if object ownership is so far empty, it should default to BucketOwnerEnforced
+	if objectOwnership == "" {
+		objectOwnership = types.ObjectOwnershipBucketOwnerEnforced
 	}
 
 	// validate the object ownership value
 	if ok := utils.IsValidOwnership(objectOwnership); !ok {
 		return &Response{
-				MetaOpts: &MetaOptions{},
+				MetaOpts: &MetaOptions{
+					BucketOwner: bucketOwner.Access,
+				},
 			}, s3err.APIError{
 				Code:           "InvalidArgument",
 				Description:    fmt.Sprintf("Invalid x-amz-object-ownership header: %v", objectOwnership),
@@ -547,26 +576,47 @@ func (c S3ApiController) CreateBucket(ctx *fiber.Ctx) (*Response, error) {
 			}
 	}
 
-	if acl+grants != "" && objectOwnership == types.ObjectOwnershipBucketOwnerEnforced {
+	// any bucket ACL(canned, grants) is not allowed with object ownership 'BucketOwnerEnforced'
+	// but there's an exception for 'private' bucket canned ACL,
+	// which is the effective default for all buckets. In this case
+	// the ACL(private canned) is allowed with 'BucketOwnerEnforced'
+	if acl != types.BucketCannedACLPrivate && string(acl)+grants != "" && objectOwnership == types.ObjectOwnershipBucketOwnerEnforced {
 		debuglogger.Logf("bucket acls are disabled for %v object ownership", objectOwnership)
 		return &Response{
 			MetaOpts: &MetaOptions{
-				BucketOwner: acct.Access,
+				BucketOwner: bucketOwner.Access,
 			},
 		}, s3err.GetAPIError(s3err.ErrInvalidBucketAclWithObjectOwnership)
 	}
 
-	if acl != "" && grants != "" {
-		debuglogger.Logf("invalid request: %q (grants) %q (acl)", grants, acl)
-		return &Response{
-			MetaOpts: &MetaOptions{
-				BucketOwner: acct.Access,
-			},
-		}, s3err.GetAPIError(s3err.ErrBothCannedAndHeaderGrants)
+	var body s3response.CreateBucketConfiguration
+	if len(ctx.Body()) != 0 {
+		// request body is optional for CreateBucket
+		err := xml.Unmarshal(ctx.Body(), &body)
+		if err != nil {
+			debuglogger.Logf("failed to parse the request body: %v", err)
+			return &Response{
+				MetaOpts: &MetaOptions{
+					BucketOwner: bucketOwner.Access,
+				},
+			}, s3err.GetAPIError(s3err.ErrMalformedXML)
+		}
+
+		if body.LocationConstraint != nil {
+			region := utils.ContextKeyRegion.Get(ctx).(string)
+			if *body.LocationConstraint != region || *body.LocationConstraint == "us-east-1" {
+				debuglogger.Logf("invalid location constraint: %s", *body.LocationConstraint)
+				return &Response{
+					MetaOpts: &MetaOptions{
+						BucketOwner: bucketOwner.Access,
+					},
+				}, s3err.GetAPIError(s3err.ErrInvalidLocationConstraint)
+			}
+		}
 	}
 
 	defACL := auth.ACL{
-		Owner: acct.Access,
+		Owner: bucketOwner.Access,
 	}
 
 	updAcl, err := auth.UpdateACL(&auth.PutBucketAclInput{
@@ -577,15 +627,15 @@ func (c S3ApiController) CreateBucket(ctx *fiber.Ctx) (*Response, error) {
 		GrantWriteACP:    &grantWriteACP,
 		AccessControlPolicy: &auth.AccessControlPolicy{
 			Owner: &types.Owner{
-				ID: &acct.Access,
+				ID: &bucketOwner.Access,
 			}},
 		ACL: types.BucketCannedACL(acl),
-	}, defACL, c.iam, acct.Role == auth.RoleAdmin)
+	}, defACL, c.iam)
 	if err != nil {
 		debuglogger.Logf("failed to update bucket acl: %v", err)
 		return &Response{
 			MetaOpts: &MetaOptions{
-				BucketOwner: acct.Access,
+				BucketOwner: bucketOwner.Access,
 			},
 		}, err
 	}
@@ -594,10 +644,25 @@ func (c S3ApiController) CreateBucket(ctx *fiber.Ctx) (*Response, error) {
 		Bucket:                     &bucket,
 		ObjectOwnership:            objectOwnership,
 		ObjectLockEnabledForBucket: &lockEnabled,
+		CreateBucketConfiguration: &types.CreateBucketConfiguration{
+			Tags: body.TagSet,
+		},
 	}, updAcl)
+	if err != nil {
+		return &Response{
+			MetaOpts: &MetaOptions{
+				BucketOwner: bucketOwner.Access,
+			},
+		}, err
+	}
+
 	return &Response{
 		MetaOpts: &MetaOptions{
-			BucketOwner: acct.Access,
+			BucketOwner: bucketOwner.Access,
 		},
-	}, err
+		Headers: map[string]*string{
+			"Location":         utils.GetStringPtr("/" + bucket),
+			"x-amz-bucket-arn": utils.GetStringPtr(auth.ResourceArnPrefix + bucket),
+		},
+	}, nil
 }

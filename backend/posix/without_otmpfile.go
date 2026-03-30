@@ -13,7 +13,6 @@
 // under the License.
 
 //go:build !linux
-// +build !linux
 
 package posix
 
@@ -62,6 +61,8 @@ func (p *Posix) openTmpFile(dir, bucket, obj string, size int64, acct auth.Accou
 	if doChown {
 		err := f.Chown(uid, gid)
 		if err != nil {
+			f.Close()
+			os.Remove(f.Name())
 			return nil, fmt.Errorf("set temp file ownership: %w", err)
 		}
 	}
@@ -76,9 +77,6 @@ var (
 
 func (tmp *tmpfile) link() error {
 	tempname := tmp.f.Name()
-	// cleanup in case anything goes wrong, if rename succeeds then
-	// this will no longer exist
-	defer os.Remove(tempname)
 
 	objPath := filepath.Join(tmp.bucket, tmp.objname)
 
@@ -105,6 +103,7 @@ func (tmp *tmpfile) Write(b []byte) (int, error) {
 
 func (tmp *tmpfile) cleanup() {
 	tmp.f.Close()
+	os.Remove(tmp.f.Name())
 }
 
 func (tmp *tmpfile) File() *os.File {

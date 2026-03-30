@@ -18,7 +18,8 @@ import (
 	"encoding/xml"
 	"fmt"
 	"net/http"
-	"os"
+	"sort"
+	"strings"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/versity/versitygw/auth"
@@ -32,41 +33,52 @@ import (
 )
 
 type S3ApiController struct {
-	be       backend.Backend
-	iam      auth.IAMService
-	logger   s3log.AuditLogger
-	evSender s3event.S3EventSender
-	mm       metrics.Manager
-	readonly bool
+	be            backend.Backend
+	iam           auth.IAMService
+	logger        s3log.AuditLogger
+	evSender      s3event.S3EventSender
+	mm            metrics.Manager
+	readonly      bool
+	disableACL    bool
+	virtualDomain string
 }
 
 const (
 	// time constants
-	iso8601Format             = "20060102T150405Z"
 	iso8601TimeFormatExtended = "Mon Jan _2 15:04:05 2006"
 	timefmt                   = "Mon, 02 Jan 2006 15:04:05 GMT"
 
-	maxXMLBodyLen     = 4 * 1024 * 1024
-	minPartNumber     = 1
-	maxPartNumber     = 10000
-	defaultMaxBuckets = int32(10000)
+	maxXMLBodyLen = 4 * 1024 * 1024
+	minPartNumber = 1
+	maxPartNumber = 10000
 
-	defaultRegion = "us-east-1"
+	defaultRegion      = "us-east-1"
+	defaultContentType = "binary/octet-stream"
 )
 
 var (
 	xmlhdr = []byte(`<?xml version="1.0" encoding="UTF-8"?>` + "\n")
 )
 
-func New(be backend.Backend, iam auth.IAMService, logger s3log.AuditLogger, evs s3event.S3EventSender, mm metrics.Manager, readonly bool) S3ApiController {
+func New(be backend.Backend, iam auth.IAMService, logger s3log.AuditLogger, evs s3event.S3EventSender, mm metrics.Manager, readonly, disableACL bool, virtualDomain string) S3ApiController {
 	return S3ApiController{
-		be:       be,
-		iam:      iam,
-		logger:   logger,
-		evSender: evs,
-		readonly: readonly,
-		mm:       mm,
+		be:            be,
+		iam:           iam,
+		logger:        logger,
+		evSender:      evs,
+		readonly:      readonly,
+		mm:            mm,
+		disableACL:    disableACL,
+		virtualDomain: virtualDomain,
 	}
+}
+
+func (c S3ApiController) getAclHeaderValue(ctx *fiber.Ctx, key string, defaultValues ...string) string {
+	if c.disableACL {
+		return ""
+	}
+
+	return ctx.Get(key, defaultValues...)
 }
 
 // Returns MethodNotAllowed for unmatched routes
@@ -147,13 +159,15 @@ func WrapMiddleware(handler fiber.Handler, logger s3log.AuditLogger, mm metrics.
 				})
 			}
 
+			ctx.Response().Header.SetContentType(fiber.MIMEApplicationXML)
+
 			serr, ok := err.(s3err.APIError)
 			if ok {
 				ctx.Status(serr.HTTPStatusCode)
 				return ctx.Send(s3err.GetAPIErrorResponse(serr, "", "", ""))
 			}
 
-			debuglogger.Logf("Internal Error, %v", err)
+			debuglogger.InternalError(err)
 			ctx.Status(http.StatusInternalServerError)
 
 			// If the error is not 's3err.APIError' return 'InternalError'
@@ -172,6 +186,7 @@ func ProcessController(ctx *fiber.Ctx, controller Controller, s3action string, s
 
 	// Set the response headers
 	SetResponseHeaders(ctx, response.Headers)
+	ensureExposeMetaHeaders(ctx)
 
 	opts := response.MetaOpts
 	if opts == nil {
@@ -195,18 +210,35 @@ func ProcessController(ctx *fiber.Ctx, controller Controller, s3action string, s
 				ObjectSize:  opts.ObjectSize,
 			})
 		}
+
+		// set content type to application/xml
+		ctx.Response().Header.SetContentType(fiber.MIMEApplicationXML)
+
 		serr, ok := err.(s3err.APIError)
 		if ok {
 			ctx.Status(serr.HTTPStatusCode)
 			return ctx.Send(s3err.GetAPIErrorResponse(serr, "", "", ""))
 		}
 
-		fmt.Fprintf(os.Stderr, "Internal Error, %v\n", err)
+		debuglogger.InternalError(err)
 		ctx.Status(http.StatusInternalServerError)
 
 		// If the error is not 's3err.APIError' return 'InternalError'
 		return ctx.Send(s3err.GetAPIErrorResponse(
 			s3err.GetAPIError(s3err.ErrInternalError), "", "", ""))
+	}
+
+	// At this point, the S3 action has succeeded in the backend and
+	// the event has already occurred. This means the S3 event must be sent,
+	// even if unexpected issues arise while further parsing the response payload.
+	if svc.EventSender != nil && opts.EventName != "" {
+		svc.EventSender.SendEvent(ctx, s3event.EventMeta{
+			BucketOwner: opts.BucketOwner,
+			ObjectSize:  opts.ObjectSize,
+			ObjectETag:  opts.ObjectETag,
+			VersionId:   opts.VersionId,
+			EventName:   opts.EventName,
+		})
 	}
 
 	if opts.Status == 0 {
@@ -215,6 +247,13 @@ func ProcessController(ctx *fiber.Ctx, controller Controller, s3action string, s
 
 	// if no data payload is provided, send the response status
 	if response.Data == nil {
+		if svc.Logger != nil {
+			svc.Logger.Log(ctx, nil, []byte{}, s3log.LogMeta{
+				Action:      s3action,
+				BucketOwner: opts.BucketOwner,
+				ObjectSize:  opts.ObjectSize,
+			})
+		}
 		ctx.Status(opts.Status)
 		return nil
 	}
@@ -227,7 +266,14 @@ func ProcessController(ctx *fiber.Ctx, controller Controller, s3action string, s
 		responseBytes = encodedResp
 	} else {
 		if responseBytes, err = xml.Marshal(response.Data); err != nil {
-			debuglogger.Logf("Internal Error, %v", err)
+			debuglogger.InternalError(err)
+			if svc.Logger != nil {
+				svc.Logger.Log(ctx, err, nil, s3log.LogMeta{
+					Action:      s3action,
+					BucketOwner: opts.BucketOwner,
+					ObjectSize:  opts.ObjectSize,
+				})
+			}
 			return ctx.Status(http.StatusInternalServerError).Send(s3err.GetAPIErrorResponse(
 				s3err.GetAPIError(s3err.ErrInternalError), "", "", ""))
 		}
@@ -237,27 +283,17 @@ func ProcessController(ctx *fiber.Ctx, controller Controller, s3action string, s
 		}
 	}
 
-	if svc.Logger != nil {
-		svc.Logger.Log(ctx, nil, responseBytes, s3log.LogMeta{
-			Action:      s3action,
-			BucketOwner: opts.BucketOwner,
-			ObjectSize:  opts.ObjectSize,
-		})
-	}
-
-	if svc.EventSender != nil {
-		svc.EventSender.SendEvent(ctx, s3event.EventMeta{
-			BucketOwner: opts.BucketOwner,
-			ObjectSize:  opts.ObjectSize,
-			ObjectETag:  opts.ObjectETag,
-			VersionId:   opts.VersionId,
-			EventName:   opts.EventName,
-		})
-	}
-
 	if ok {
 		if len(responseBytes) > 0 {
 			ctx.Response().Header.Set("Content-Length", fmt.Sprint(len(responseBytes)))
+		}
+
+		if svc.Logger != nil {
+			svc.Logger.Log(ctx, nil, responseBytes, s3log.LogMeta{
+				Action:      s3action,
+				BucketOwner: opts.BucketOwner,
+				ObjectSize:  opts.ObjectSize,
+			})
 		}
 
 		return ctx.Send(responseBytes)
@@ -267,7 +303,17 @@ func ProcessController(ctx *fiber.Ctx, controller Controller, s3action string, s
 	if msglen > maxXMLBodyLen {
 		debuglogger.Logf("XML encoded body len %v exceeds max len %v",
 			msglen, maxXMLBodyLen)
+		if svc.Logger != nil {
+			svc.Logger.Log(ctx, err, []byte{}, s3log.LogMeta{
+				Action:      s3action,
+				BucketOwner: opts.BucketOwner,
+				ObjectSize:  opts.ObjectSize,
+			})
+		}
 		ctx.Status(http.StatusInternalServerError)
+
+		// set content type to application/xml
+		ctx.Response().Header.SetContentType(fiber.MIMEApplicationXML)
 
 		return ctx.Send(s3err.GetAPIErrorResponse(
 			s3err.GetAPIError(s3err.ErrInternalError), "", "", ""))
@@ -279,7 +325,86 @@ func ProcessController(ctx *fiber.Ctx, controller Controller, s3action string, s
 	// Set the Content-Length header
 	ctx.Response().Header.SetContentLength(msglen)
 
+	if svc.Logger != nil {
+		svc.Logger.Log(ctx, nil, responseBytes, s3log.LogMeta{
+			Action:      s3action,
+			BucketOwner: opts.BucketOwner,
+			ObjectSize:  opts.ObjectSize,
+		})
+	}
+
 	return ctx.Send(res)
+}
+
+func ensureExposeMetaHeaders(ctx *fiber.Ctx) {
+	// Only attempt to modify expose headers when CORS is actually in use.
+	if len(ctx.Response().Header.Peek("Access-Control-Allow-Origin")) == 0 {
+		return
+	}
+
+	existing := strings.TrimSpace(string(ctx.Response().Header.Peek("Access-Control-Expose-Headers")))
+	if existing == "*" {
+		return
+	}
+
+	lowerExisting := map[string]struct{}{}
+	if existing != "" {
+		for part := range strings.SplitSeq(existing, ",") {
+			p := strings.ToLower(strings.TrimSpace(part))
+			if p != "" {
+				lowerExisting[p] = struct{}{}
+			}
+		}
+	}
+
+	metaNames := map[string]struct{}{}
+	for k := range ctx.Response().Header.All() {
+		key := string(k)
+		if strings.HasPrefix(strings.ToLower(key), "x-amz-meta-") {
+			metaNames[key] = struct{}{}
+		}
+	}
+	if len(metaNames) == 0 {
+		// Still ensure ETag is present if any expose headers exist/are needed.
+		if _, ok := lowerExisting["etag"]; ok {
+			return
+		}
+		if existing == "" {
+			ctx.Response().Header.Set("Access-Control-Expose-Headers", "ETag")
+			return
+		}
+		ctx.Response().Header.Set("Access-Control-Expose-Headers", existing+", ETag")
+		return
+	}
+
+	metaList := make([]string, 0, len(metaNames))
+	for k := range metaNames {
+		metaList = append(metaList, k)
+	}
+	sort.Strings(metaList)
+
+	toAdd := make([]string, 0, 1+len(metaList))
+	if _, ok := lowerExisting["etag"]; !ok {
+		toAdd = append(toAdd, "ETag")
+		lowerExisting["etag"] = struct{}{}
+	}
+	for _, h := range metaList {
+		lh := strings.ToLower(h)
+		if _, ok := lowerExisting[lh]; ok {
+			continue
+		}
+		toAdd = append(toAdd, h)
+		lowerExisting[lh] = struct{}{}
+	}
+	if len(toAdd) == 0 {
+		return
+	}
+
+	if existing == "" {
+		ctx.Response().Header.Set("Access-Control-Expose-Headers", strings.Join(toAdd, ", "))
+		return
+	}
+	ctx.Response().Header.Set("Access-Control-Expose-Headers", existing+", "+strings.Join(toAdd, ", "))
 }
 
 // Sets the response headers
@@ -287,6 +412,8 @@ func SetResponseHeaders(ctx *fiber.Ctx, headers map[string]*string) {
 	if headers == nil {
 		return
 	}
+
+	ctx.Response().Header.DisableNormalizing()
 	for key, val := range headers {
 		if val == nil || *val == "" {
 			continue

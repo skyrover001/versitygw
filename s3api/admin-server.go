@@ -15,57 +15,88 @@
 package s3api
 
 import (
-	"crypto/tls"
+	"fmt"
+	"net"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/logger"
+	"github.com/gofiber/fiber/v2/middleware/recover"
 	"github.com/versity/versitygw/auth"
 	"github.com/versity/versitygw/backend"
+	"github.com/versity/versitygw/debuglogger"
 	"github.com/versity/versitygw/s3api/controllers"
 	"github.com/versity/versitygw/s3api/middlewares"
+	"github.com/versity/versitygw/s3api/utils"
 	"github.com/versity/versitygw/s3log"
 )
 
 type S3AdminServer struct {
-	app     *fiber.App
-	backend backend.Backend
-	router  *S3AdminRouter
-	port    string
-	cert    *tls.Certificate
-	quiet   bool
-	debug   bool
+	app             *fiber.App
+	backend         backend.Backend
+	router          *S3AdminRouter
+	CertStorage     *utils.CertStorage
+	quiet           bool
+	debug           bool
+	corsAllowOrigin string
+	maxConnections  int
+	maxRequests     int
 }
 
-func NewAdminServer(app *fiber.App, be backend.Backend, root middlewares.RootUserConfig, port, region string, iam auth.IAMService, l s3log.AuditLogger, opts ...AdminOpt) *S3AdminServer {
+func NewAdminServer(be backend.Backend, root middlewares.RootUserConfig, region string, iam auth.IAMService, l s3log.AuditLogger, ctrl controllers.S3ApiController, opts ...AdminOpt) *S3AdminServer {
 	server := &S3AdminServer{
-		app:     app,
 		backend: be,
-		router:  new(S3AdminRouter),
-		port:    port,
+		router: &S3AdminRouter{
+			s3api: ctrl,
+		},
 	}
 
 	for _, opt := range opts {
 		opt(server)
 	}
 
+	app := fiber.New(fiber.Config{
+		AppName:               "versitygw",
+		ServerHeader:          "VERSITYGW",
+		Network:               fiber.NetworkTCP,
+		DisableStartupMessage: true,
+		ErrorHandler:          globalErrorHandler,
+		Concurrency:           server.maxConnections,
+	})
+
+	server.app = app
+
+	app.Use(recover.New(
+		recover.Config{
+			EnableStackTrace:  true,
+			StackTraceHandler: stackTraceHandler,
+		}))
+
 	// Logging middlewares
 	if !server.quiet {
 		app.Use(logger.New(logger.Config{
-			Format: "${time} | ${status} | ${latency} | ${ip} | ${method} | ${path} | ${error} | ${queryParams}\n",
+			Format: "${time} | adm | ${status} | ${latency} | ${ip} | ${method} | ${path} | ${error} | ${queryParams}\n",
 		}))
 	}
-	app.Use(controllers.WrapMiddleware(middlewares.DecodeURL, l, nil))
-	app.Use(middlewares.DebugLogger())
 
-	server.router.Init(app, be, iam, l, root, region, server.debug)
+	// initialize total requests cap limiter middleware
+	app.Use(middlewares.RateLimiter(server.maxRequests, nil, l))
+
+	app.Use(controllers.WrapMiddleware(middlewares.DecodeURL, l, nil))
+
+	// initialize the debug logger in debug mode
+	if debuglogger.IsDebugEnabled() {
+		app.Use(middlewares.DebugLogger())
+	}
+
+	server.router.Init(app, be, iam, l, root, region, server.debug, server.corsAllowOrigin)
 
 	return server
 }
 
 type AdminOpt func(s *S3AdminServer)
 
-func WithAdminSrvTLS(cert tls.Certificate) AdminOpt {
-	return func(s *S3AdminServer) { s.cert = &cert }
+func WithAdminSrvTLS(cs *utils.CertStorage) AdminOpt {
+	return func(s *S3AdminServer) { s.CertStorage = cs }
 }
 
 // WithQuiet silences default logging output
@@ -78,9 +109,60 @@ func WithAdminDebug() AdminOpt {
 	return func(s *S3AdminServer) { s.debug = true }
 }
 
-func (sa *S3AdminServer) Serve() (err error) {
-	if sa.cert != nil {
-		return sa.app.ListenTLSWithCertificate(sa.port, *sa.cert)
+// WithAdminCORSAllowOrigin sets the default CORS Access-Control-Allow-Origin value
+// for the standalone admin server.
+func WithAdminCORSAllowOrigin(origin string) AdminOpt {
+	return func(s *S3AdminServer) { s.corsAllowOrigin = origin }
+}
+
+// WithAdminConcurrencyLimiter sets the admin standalone server's maximum
+// connection limit and the hard limit for in-flight requests.
+func WithAdminConcurrencyLimiter(maxConnections, maxRequests int) AdminOpt {
+	return func(s *S3AdminServer) {
+		s.maxConnections = maxConnections
+		s.maxRequests = maxRequests
 	}
-	return sa.app.Listen(sa.port)
+}
+
+// ServeMultiPort creates listeners for multiple port specifications and serves
+// on all of them simultaneously. This supports listening on multiple ports and/or
+// addresses (e.g., [":8080", "localhost:8081"]).
+func (sa *S3AdminServer) ServeMultiPort(ports []string) error {
+	if len(ports) == 0 {
+		return fmt.Errorf("no ports specified")
+	}
+
+	// Multiple ports - create listeners for each
+	var listeners []net.Listener
+
+	for _, portSpec := range ports {
+		var ln net.Listener
+		var err error
+
+		if sa.CertStorage != nil {
+			ln, err = utils.NewMultiAddrTLSListener(sa.app.Config().Network, portSpec, sa.CertStorage.GetCertificate)
+		} else {
+			ln, err = utils.NewMultiAddrListener(sa.app.Config().Network, portSpec)
+		}
+
+		if err != nil {
+			return fmt.Errorf("failed to bind admin listener %s: %w", portSpec, err)
+		}
+
+		listeners = append(listeners, ln)
+	}
+
+	if len(listeners) == 0 {
+		return fmt.Errorf("failed to create any admin listeners")
+	}
+
+	// Combine all listeners
+	finalListener := utils.NewMultiListener(listeners...)
+
+	return sa.app.Listener(finalListener)
+}
+
+// ShutDown gracefully shuts down the server with a context timeout
+func (sa S3AdminServer) Shutdown() error {
+	return sa.app.ShutdownWithTimeout(shutDownDuration)
 }

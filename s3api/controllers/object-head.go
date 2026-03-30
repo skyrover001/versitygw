@@ -57,6 +57,7 @@ func (c S3ApiController) HeadObject(ctx *fiber.Ctx) (*Response, error) {
 			Object:          key,
 			Action:          action,
 			IsPublicRequest: isPublicBucket,
+			DisableACL:      c.disableACL,
 		})
 	if err != nil {
 		return &Response{
@@ -78,6 +79,15 @@ func (c S3ApiController) HeadObject(ctx *fiber.Ctx) (*Response, error) {
 		}
 
 		partNumber = &partNumberQuery
+	}
+
+	err = utils.ValidateVersionId(versionId)
+	if err != nil {
+		return &Response{
+			MetaOpts: &MetaOptions{
+				BucketOwner: parsedAcl.Owner,
+			},
+		}, err
 	}
 
 	checksumMode := types.ChecksumMode(strings.ToUpper(ctx.Get("x-amz-checksum-mode")))
@@ -126,30 +136,31 @@ func (c S3ApiController) HeadObject(ctx *fiber.Ctx) (*Response, error) {
 
 	return &Response{
 		Headers: map[string]*string{
-			"ETag":                                res.ETag,
-			"x-amz-restore":                       res.Restore,
-			"accept-ranges":                       res.AcceptRanges,
 			"Content-Range":                       res.ContentRange,
 			"Content-Disposition":                 res.ContentDisposition,
 			"Content-Encoding":                    res.ContentEncoding,
 			"Content-Language":                    res.ContentLanguage,
 			"Cache-Control":                       res.CacheControl,
+			"Content-Length":                      utils.ConvertPtrToStringPtr(res.ContentLength),
+			"Content-Type":                        res.ContentType,
 			"Expires":                             res.ExpiresString,
+			"ETag":                                res.ETag,
+			"Last-Modified":                       utils.FormatDatePtrToString(res.LastModified, timefmt),
+			"x-amz-restore":                       res.Restore,
+			"accept-ranges":                       res.AcceptRanges,
 			"x-amz-checksum-crc32":                res.ChecksumCRC32,
 			"x-amz-checksum-crc64nvme":            res.ChecksumCRC64NVME,
 			"x-amz-checksum-crc32c":               res.ChecksumCRC32C,
 			"x-amz-checksum-sha1":                 res.ChecksumSHA1,
 			"x-amz-checksum-sha256":               res.ChecksumSHA256,
-			"Content-Type":                        res.ContentType,
 			"x-amz-version-id":                    res.VersionId,
-			"Content-Length":                      utils.ConvertPtrToStringPtr(res.ContentLength),
 			"x-amz-mp-parts-count":                utils.ConvertPtrToStringPtr(res.PartsCount),
 			"x-amz-object-lock-mode":              utils.ConvertToStringPtr(res.ObjectLockMode),
 			"x-amz-object-lock-legal-hold":        utils.ConvertToStringPtr(res.ObjectLockLegalHoldStatus),
 			"x-amz-storage-class":                 utils.ConvertToStringPtr(res.StorageClass),
 			"x-amz-checksum-type":                 utils.ConvertToStringPtr(res.ChecksumType),
 			"x-amz-object-lock-retain-until-date": utils.FormatDatePtrToString(res.ObjectLockRetainUntilDate, time.RFC3339),
-			"Last-Modified":                       utils.FormatDatePtrToString(res.LastModified, timefmt),
+			"x-amz-tagging-count":                 utils.ConvertPtrToStringPtr(res.TagCount),
 		},
 		MetaOpts: &MetaOptions{
 			BucketOwner: parsedAcl.Owner,

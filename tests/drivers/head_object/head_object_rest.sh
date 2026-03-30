@@ -48,7 +48,7 @@ verify_object_exists() {
   if ! check_param_count_v2 "bucket name, key" 2 $#; then
     return 1
   fi
-  if ! head_object_rest_expect_success "$1" "$2" "" "200"; then
+  if ! head_object_rest_expect_success "$1" "$2" ""; then
     log 2 "error sending HeadObject command and verifying existence"
     return 1
   fi
@@ -199,6 +199,31 @@ check_metadata() {
   if [ "$meta_key" != "x-amz-meta-${lowercase_key}" ]; then
     log 2 "expected metadata key of '$lowercase_key', was '$meta_key"
     return 1
+  fi
+  return 0
+}
+
+check_header_key_and_value() {
+  if ! check_param_count_v2 "data file" 1 $#; then
+    return 1
+  fi
+  if ! check_for_header_key_and_value "$1" "$header_key" "$header_value"; then
+    log 2 "error checking header key '$header_key' and value '$header_value'"
+    return 1
+  fi
+  return 0
+}
+
+head_object_check_header_key_and_value() {
+  if ! check_param_count_v2 "bucket, key, expected key, expected value" 4 $#; then
+    return 1
+  fi
+  header_key="$3"
+  header_value="$4"
+  if ! send_rest_go_command_callback "200" "check_header_key_and_value" "-bucketName" "$1" "-objectKey" "$2" \
+    "-method" "HEAD"; then
+      log 2 "error with head object command or callback"
+      return 1
   fi
   return 0
 }

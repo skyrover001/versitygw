@@ -15,12 +15,14 @@
 package utils
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/xml"
 	"errors"
 	"math/rand"
 	"net/http"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -81,7 +83,7 @@ func TestCreateHttpRequestFromCtx(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := createHttpRequestFromCtx(tt.args.ctx, tt.hdrs, 0)
+			got, err := createHttpRequestFromCtx(tt.args.ctx, tt.hdrs, 0, true)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("CreateHttpRequestFromCtx() error = %v, wantErr %v", err, tt.wantErr)
 				return
@@ -94,35 +96,134 @@ func TestCreateHttpRequestFromCtx(t *testing.T) {
 	}
 }
 
-func TestGetUserMetaData(t *testing.T) {
-	type args struct {
-		headers *fasthttp.RequestHeader
+// a helper method to construct a raw http request with the given http request headers
+// to further parse with fasthttp.Request.Read and return fasthttp.RequestHeader
+func createHeadersFromRawRequest(t *testing.T, hdrs [][2]string) *fasthttp.RequestHeader {
+	t.Helper()
+
+	var b strings.Builder
+	b.WriteString("PUT / HTTP/1.1\r\n")
+	b.WriteString("Host: example.com\r\n")
+	for _, kv := range hdrs {
+		b.WriteString(kv[0])
+		b.WriteString(": ")
+		b.WriteString(kv[1])
+		b.WriteString("\r\n")
 	}
+	b.WriteString("\r\n")
 
-	app := fiber.New()
+	var req fasthttp.Request
+	if err := req.Read(bufio.NewReader(bytes.NewReader([]byte(b.String())))); err != nil {
+		t.Fatalf("failed to parse raw request: %v", err)
+	}
+	return &req.Header
+}
 
-	// Case 1
-	ctx := app.AcquireCtx(&fasthttp.RequestCtx{})
-	req := ctx.Request()
-
+func TestGetUserMetaData(t *testing.T) {
 	tests := []struct {
-		name         string
-		args         args
-		wantMetadata map[string]string
+		name    string
+		hdrs    [][2]string
+		want    map[string]string
+		wantErr error
 	}{
 		{
-			name: "Success-empty-response",
-			args: args{
-				headers: &req.Header,
+			name: "no metadata headers",
+			hdrs: [][2]string{
+				{"Content-Type", "application/json"},
 			},
-			wantMetadata: map[string]string{},
+			want: map[string]string{},
+		},
+		{
+			name: "single metadata header",
+			hdrs: [][2]string{
+				{"x-amz-meta-foo", "bar"},
+			},
+			want: map[string]string{"foo": "bar"},
+		},
+		{
+			name: "multiple metadata headers",
+			hdrs: [][2]string{
+				{"x-amz-meta-foo", "bar"},
+				{"x-amz-meta-baz", "qux"},
+			},
+			want: map[string]string{"foo": "bar", "baz": "qux"},
+		},
+		{
+			name: "case-insensitive prefix and key lowercasing",
+			hdrs: [][2]string{
+				{"X-Amz-Meta-TestKey", "Value"},
+			},
+			want: map[string]string{"testkey": "Value"},
+		},
+		{
+			name: "ignores non-metadata headers",
+			hdrs: [][2]string{
+				{"authorization", "token"},
+				{"x-amz-meta-foo", "bar"},
+			},
+			want: map[string]string{"foo": "bar"},
+		},
+		{
+			name: "metadata size exceeds limit (single header)",
+			hdrs: [][2]string{
+				{"x-amz-meta-big", strings.Repeat("a", maxMetadataSize+1)},
+			},
+			wantErr: s3err.GetAPIError(s3err.ErrMetadataTooLarge),
+		},
+		{
+			name: "metadata cumulative size exceeds limit (multiple headers)",
+			hdrs: [][2]string{
+				{"x-amz-meta-a", strings.Repeat("a", maxMetadataSize/2)},
+				{"x-amz-meta-b", strings.Repeat("b", maxMetadataSize/2+10)},
+			},
+			wantErr: s3err.GetAPIError(s3err.ErrMetadataTooLarge),
+		},
+		{
+			name: "duplicate keys combined",
+			hdrs: [][2]string{
+				{"x-amz-meta-Foo", "first"},
+				{"x-amz-meta-foo", "second"},
+			},
+			want: map[string]string{"foo": "first,second"},
+		},
+		{
+			name: "duplicate same value keys combined",
+			hdrs: [][2]string{
+				{"x-amz-meta-Foo", "value"},
+				{"x-amz-meta-foo", "value"},
+			},
+			want: map[string]string{"foo": "value,value"},
+		},
+		{
+			name: "mixed keys",
+			hdrs: [][2]string{
+				{"x-amz-meta-Foo", "value2"},
+				{"x-amz-meta-fOo", "value1"},
+				{"x-amz-meta-foO", "value3"},
+				{"x-amz-meta-bar", "baz"},
+				{"x-amz-meta-quxx", "efg"},
+				{"x-amz-meta-abc", "value"},
+				{"x-amz-meta-Abc", "value"},
+				{"x-amz-meta-aBc", "value"},
+				{"x-amz-meta-abC", "value"},
+				{"x-amz-meta-ABC", "value"},
+			},
+			want: map[string]string{
+				"foo":  "value2,value1,value3",
+				"bar":  "baz",
+				"quxx": "efg",
+				"abc":  "value,value,value,value,value",
+			},
 		},
 	}
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if gotMetadata := GetUserMetaData(tt.args.headers); !reflect.DeepEqual(gotMetadata, tt.wantMetadata) {
-				t.Errorf("GetUserMetaData() = %v, want %v", gotMetadata, tt.wantMetadata)
-			}
+			h := createHeadersFromRawRequest(t, tt.hdrs)
+
+			got, err := GetUserMetaData(h)
+			assert.Equal(t, tt.wantErr, err)
+			assert.Equal(t, tt.want, got)
 		})
 	}
 }
@@ -231,67 +332,202 @@ func TestIsValidBucketName(t *testing.T) {
 	}
 }
 
-func TestParseUint(t *testing.T) {
+func TestSetBucketNameValidationStrict(t *testing.T) {
+	SetBucketNameValidationStrict(true)
+	t.Cleanup(func() {
+		SetBucketNameValidationStrict(true)
+	})
+
+	invalidBucket := "Invalid_Bucket"
+	if IsValidBucketName(invalidBucket) {
+		t.Fatalf("expected %q to be invalid with strict validation", invalidBucket)
+	}
+
+	SetBucketNameValidationStrict(false)
+	if !IsValidBucketName(invalidBucket) {
+		t.Fatalf("expected %q to be accepted when strict validation disabled", invalidBucket)
+	}
+
+	SetBucketNameValidationStrict(true)
+	if IsValidBucketName(invalidBucket) {
+		t.Fatalf("expected %q to be invalid after re-enabling strict validation", invalidBucket)
+	}
+}
+
+func TestParseMaxLimiter(t *testing.T) {
 	type args struct {
 		str string
+		lt  LimiterType
+	}
+	type expected struct {
+		err error
+		res int32
 	}
 	tests := []struct {
-		name    string
-		args    args
-		want    int32
-		wantErr bool
+		name     string
+		args     args
+		expected expected
 	}{
 		{
-			name: "Parse-uint-empty-string",
+			name: "empty_string",
 			args: args{
 				str: "",
+				lt:  LimiterTypeMaxKeys,
 			},
-			want:    1000,
-			wantErr: false,
+			expected: expected{
+				err: nil,
+				res: 1000,
+			},
 		},
 		{
-			name: "Parse-uint-invalid-number-string",
+			name: "empty_max-buckets",
+			args: args{
+				str: "",
+				lt:  LimiterTypeMaxBuckets,
+			},
+			expected: expected{
+				err: nil,
+				res: 10000,
+			},
+		},
+		{
+			name: "invalid_max-parts",
 			args: args{
 				str: "bla",
+				lt:  LimiterTypeMaxParts,
 			},
-			want:    1000,
-			wantErr: true,
+			expected: expected{
+				err: s3err.GetInvalidMaxLimiterErr(string(LimiterTypeMaxParts)),
+				res: 0,
+			},
 		},
 		{
-			name: "Parse-uint-invalid-negative-number",
+			name: "invalid_max-uploads",
+			args: args{
+				str: "invalid",
+				lt:  LimiterTypeMaxUploads,
+			},
+			expected: expected{
+				err: s3err.GetInvalidMaxLimiterErr(string(LimiterTypeMaxUploads)),
+				res: 0,
+			},
+		},
+		{
+			name: "invalid_max-buckets",
+			args: args{
+				str: "invalid",
+				lt:  LimiterTypeMaxBuckets,
+			},
+			expected: expected{
+				err: s3err.GetInvalidMaxLimiterErr(string(LimiterTypeMaxBuckets)),
+				res: 0,
+			},
+		},
+		{
+			name: "invalid_versions_max-keys",
+			args: args{
+				str: "invalid",
+				lt:  LimiterTypeMaxKeys,
+			},
+			expected: expected{
+				err: s3err.GetInvalidMaxLimiterErr(string(LimiterTypeMaxKeys)),
+				res: 0,
+			},
+		},
+		{
+			name: "negative_max-keys",
 			args: args{
 				str: "-5",
+				lt:  LimiterTypeMaxKeys,
 			},
-			want:    1000,
-			wantErr: true,
+			expected: expected{
+				err: s3err.GetNegativeMaxLimiterErr(string(LimiterTypeMaxKeys)),
+				res: 0,
+			},
 		},
 		{
-			name: "Parse-uint-success",
+			name: "negative_part-number-marker",
+			args: args{
+				str: "-5",
+				lt:  LimiterTypePartNumberMarker,
+			},
+			expected: expected{
+				err: s3err.GetNegativeMaxLimiterErr(string(LimiterTypePartNumberMarker)),
+				res: 0,
+			},
+		},
+		{
+			name: "negative_max-buckets",
+			args: args{
+				str: "-12",
+				lt:  LimiterTypeMaxBuckets,
+			},
+			expected: expected{
+				err: s3err.GetAPIError(s3err.ErrInvalidMaxBuckets),
+				res: 0,
+			},
+		},
+		{
+			name: "negative_versions_max-keys",
+			args: args{
+				str: "-12",
+				lt:  LimiterTypeVersionsMaxKeys,
+			},
+			expected: expected{
+				err: s3err.GetAPIError(s3err.ErrNegativeMaxKeys),
+				res: 0,
+			},
+		},
+		{
+			name: "greater_than_10000_max-buckets",
+			args: args{
+				str: "25000",
+				lt:  LimiterTypeMaxBuckets,
+			},
+			expected: expected{
+				err: s3err.GetAPIError(s3err.ErrInvalidMaxBuckets),
+				res: 0,
+			},
+		},
+		{
+			name: "greater_than_1000_max-buckets",
+			args: args{
+				str: "1300",
+				lt:  LimiterTypeMaxBuckets,
+			},
+			expected: expected{
+				err: nil,
+				res: 1300,
+			},
+		},
+		{
+			name: "greater_than_1000",
+			args: args{
+				str: "25000",
+				lt:  LimiterTypeMaxParts,
+			},
+			expected: expected{
+				err: nil,
+				res: 1000,
+			},
+		},
+		{
+			name: "success",
 			args: args{
 				str: "23",
+				lt:  LimiterTypeMaxUploads,
 			},
-			want:    23,
-			wantErr: false,
-		},
-		{
-			name: "Parse-uint-greater-than-1000",
-			args: args{
-				str: "25000000",
+			expected: expected{
+				err: nil,
+				res: 23,
 			},
-			want:    1000,
-			wantErr: false,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := ParseUint(tt.args.str)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("ParseMaxKeys() error = %v, wantErr %v", err, tt.wantErr)
-				return
-			}
-			if got != tt.want {
-				t.Errorf("ParseMaxKeys() = %v, want %v", got, tt.want)
-			}
+			got, err := ParseMaxLimiter(tt.args.str, tt.args.lt)
+			assert.Equal(t, tt.expected.err, err)
+			assert.Equal(t, tt.expected.res, got)
 		})
 	}
 }
@@ -756,7 +992,7 @@ func TestParseTagging(t *testing.T) {
 			},
 		}
 
-		for i := 0; i < lgth; i++ {
+		for range lgth {
 			res.TagSet.Tags = append(res.TagSet.Tags, s3response.Tag{
 				Key:   genRandStr(10),
 				Value: genRandStr(20),
@@ -933,12 +1169,15 @@ func TestValidateCopySource(t *testing.T) {
 		{"invalid object name 3", "bucket", s3err.GetAPIError(s3err.ErrInvalidCopySourceObject)},
 		{"invalid object name 4", "bucket/../foo/dir/../../../", s3err.GetAPIError(s3err.ErrInvalidCopySourceObject)},
 		{"invalid object name 5", "bucket/.?versionId=smth", s3err.GetAPIError(s3err.ErrInvalidCopySourceObject)},
+		// invalid versionId
+		{"invalid versionId 1", "bucket/object?versionId=invalid", s3err.GetAPIError(s3err.ErrInvalidVersionId)},
+		{"invalid versionId 2", "bucket/object?versionId=01BX5ZZKBKACTAV9WEVGEMMV", s3err.GetAPIError(s3err.ErrInvalidVersionId)},
 		// success
 		{"no error 1", "bucket/object", nil},
 		{"no error 2", "bucket/object/key", nil},
 		{"no error 3", "bucket/4*&(*&(89765))", nil},
 		{"no error 4", "bucket/foo/../bar", nil},
-		{"no error 5", "bucket/foo/bar/baz?versionId=id", nil},
+		{"no error 5", "bucket/foo/bar/baz?versionId=01BX5ZZKBKACTAV9WEVGEMMVRZ", nil},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

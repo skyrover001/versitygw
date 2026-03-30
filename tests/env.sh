@@ -16,10 +16,37 @@
 
 source ./tests/versity.sh
 
+if [ -n "$BASH_VERSION" ] && [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
+  echo "ERROR: This test suite requires bash 4.0 or later. Current: $BASH_VERSION" >&2
+  echo "On macOS: brew install bash && add to PATH" >&2
+  exit 1
+fi
+
 base_setup() {
   check_env_vars
-  if [ "$RUN_VERSITYGW" == "true" ]; then
-    run_versity_app
+  if [ "$RUN_VERSITYGW" == "true" ] && [ "$UNIT_TEST" != "true" ]; then
+    if ! run_versity_app; then
+      exit 1
+    fi
+  fi
+}
+
+setup_test_log_file() {
+  if [ -n "$TEST_LOG_FILE" ]; then
+    if ! error=$(touch "$TEST_LOG_FILE.tmp" 2>&1); then
+      log 2 "error creating log file: $error"
+      exit 1
+    fi
+    export TEST_LOG_FILE
+  fi
+}
+
+remove_test_log_file_if_desired() {
+  if [ "$REMOVE_TEST_FILE_FOLDER" == "true" ]; then
+    log 6 "removing test file folder"
+    if ! error=$(rm -rf "${TEST_FILE_FOLDER:?}" 2>&1); then
+      log 3 "unable to remove test file folder: $error"
+    fi
   fi
 }
 
@@ -80,6 +107,16 @@ check_aws_vars() {
       log 1 "AWS_ENDPOINT_URL missing"
       exit 1
     fi
+    export SERVER_NAME="versitygw"
+  else
+    if [ -z "$SERVER_NAME" ]; then
+      export SERVER_NAME="amazonS3"
+    else
+      export SERVER_NAME
+    fi
+  fi
+  if [ -n "$TEMPLATE_MATRIX_FILE" ]; then
+    export TEMPLATE_MATRIX_FILE
   fi
   # exporting these since they're needed for subshells
   export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_REGION AWS_PROFILE AWS_ENDPOINT_URL
@@ -139,6 +176,9 @@ check_universal_vars() {
   fi
   if [ -n "$MAX_FILE_DOWNLOAD_CHUNK_SIZE" ]; then
     export MAX_FILE_DOWNLOAD_CHUNK_SIZE
+  fi
+  if [ -n "$COVERAGE_LOG" ]; then
+    export COVERAGE_LOG
   fi
 
   check_aws_vars
@@ -281,11 +321,32 @@ check_user_vars() {
       exit 1
     fi
     IAM_PARAMS="--s3-iam-access $AWS_ACCESS_KEY_ID --s3-iam-secret $AWS_SECRET_ACCESS_KEY \
-      --s3-iam-region us-east-1 --s3-iam-bucket $USERS_BUCKET --s3-iam-endpoint $AWS_ENDPOINT_URL \
+      --s3-iam-region $AWS_REGION --s3-iam-bucket $USERS_BUCKET --s3-iam-endpoint $AWS_ENDPOINT_URL \
       --s3-iam-noverify"
     export IAM_PARAMS
     return 0
   fi
   log 1 "unrecognized IAM_TYPE value: $IAM_TYPE"
   exit 1
+}
+
+log_cleanup() {
+  if [ -e "$TEST_LOG_FILE.tmp" ]; then
+    if ! error=$(cat "$TEST_LOG_FILE.tmp" >> "$TEST_LOG_FILE" 2>&1); then
+      log 3 "error appending temp log to main log: $error"
+    fi
+    if ! delete_temp_log_if_exists; then
+      log 3 "error deleting temp log"
+    fi
+  fi
+}
+
+delete_temp_log_if_exists() {
+  if [ -e "$TEST_LOG_FILE.tmp" ]; then
+    if ! error=$(rm "$TEST_LOG_FILE.tmp" 2>&1); then
+      log 2 "error deleting temp log: $error"
+      return 1
+    fi
+  fi
+  return 0
 }

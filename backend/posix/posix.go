@@ -40,9 +40,11 @@ import (
 	"github.com/versity/versitygw/backend"
 	"github.com/versity/versitygw/backend/meta"
 	"github.com/versity/versitygw/debuglogger"
+	"github.com/versity/versitygw/s3api/middlewares"
 	"github.com/versity/versitygw/s3api/utils"
 	"github.com/versity/versitygw/s3err"
 	"github.com/versity/versitygw/s3response"
+	"golang.org/x/sync/semaphore"
 )
 
 type Posix struct {
@@ -78,6 +80,24 @@ type Posix struct {
 	// if the filesystem supports it. This is needed for cases where
 	// there are different filesystems mounted below the bucket level.
 	forceNoTmpFile bool
+
+	// forceNoCopyFileRange is a flag to disable the use of io.Copy to
+	// reassemble multipart upload parts, which uses copy_file_range on
+	// linux. This is needed for cases where a filesystem that does not
+	// support copy_file_range is mounted over NFSv4.2.
+	forceNoCopyFileRange bool
+
+	// enable posix level bucket name validations, not needed if the
+	// frontend handlers are already validating bucket names
+	validateBucketName bool
+
+	// actionLimiter limits the number of concurrently running POSIX actions.
+	// The primary goal is to bound OS thread growth: when goroutines block in
+	// filesystem syscalls, the Go scheduler may spawn additional OS threads to
+	// keep other goroutines runnable. Since nearly all POSIX actions eventually
+	// execute blocking syscalls (stat, readdir, xattr, open, etc.), this limiter
+	// constrains parallelism to prevent excessive thread creation under load.
+	actionLimiter *semaphore.Weighted
 }
 
 var _ backend.Backend = &Posix{}
@@ -87,7 +107,8 @@ const (
 	MetaTmpMultipartDir = MetaTmpDir + "/multipart"
 	onameAttr           = "objname"
 	tagHdr              = "X-Amz-Tagging"
-	metaHdr             = "X-Amz-Meta"
+	oldMetaHdr          = "X-Amz-Meta"
+	metadataHdr         = "metadata"
 	contentTypeHdr      = "content-type"
 	contentEncHdr       = "content-encoding"
 	contentLangHdr      = "content-language"
@@ -107,11 +128,15 @@ const (
 	versioningKey       = "versioning"
 	deleteMarkerKey     = "delete-marker"
 	versionIdKey        = "version-id"
+	partCrc64nvme       = "part-crc64nvme"
 
 	nullVersionId = "null"
 
 	doFalloc   = true
 	skipFalloc = false
+
+	// defaultConcurrency is the default limit for concurrent POSIX actions.
+	defaultConcurrency = 5000
 )
 
 // PosixOpts are the options for the Posix backend
@@ -131,6 +156,21 @@ type PosixOpts struct {
 	// ForceNoTmpFile disables the use of O_TMPFILE even if the filesystem
 	// supports it
 	ForceNoTmpFile bool
+	// ForceNoCopyFileRange disables the use of io.Copy for multipart uploads parts
+	ForceNoCopyFileRange bool
+	// ValidateBucketNames enables minimal bucket name validation to prevent
+	// incorrect access to the filesystem. This is only needed if the
+	// frontend is not already validating bucket names.
+	ValidateBucketNames bool
+	// Concurrency sets the maximum number of concurrently running POSIX actions.
+	// It is intended to bound OS thread growth caused by goroutines blocking in
+	// filesystem-heavy syscalls (e.g., stat, readdir, xattr), which can otherwise
+	// trigger additional thread creation under load.
+	// This acts as a backpressure mechanism: once the limit is reached, new
+	// actions are queued until capacity becomes available. As a result, if the
+	// queue depth grows under sustained load, request latency increases and
+	// upstream timeouts may occur.
+	Concurrency int
 }
 
 func New(rootdir string, meta meta.MetadataStorer, opts PosixOpts) (*Posix, error) {
@@ -153,10 +193,10 @@ func New(rootdir string, meta meta.MetadataStorer, opts PosixOpts) (*Posix, erro
 		return nil, fmt.Errorf("get absolute path of %v: %w", rootdir, err)
 	}
 
-	var verioningdirAbs string
+	var versioningdirAbs string
 	// Ensure the versioning directory isn't within the root directory
 	if opts.VersioningDir != "" {
-		verioningdirAbs, err = validateSubDir(rootdirAbs, opts.VersioningDir)
+		versioningdirAbs, err = validateSubDir(rootdirAbs, opts.VersioningDir)
 		if err != nil {
 			return nil, err
 		}
@@ -171,8 +211,8 @@ func New(rootdir string, meta meta.MetadataStorer, opts PosixOpts) (*Posix, erro
 		}
 	}
 
-	if verioningdirAbs != "" {
-		fmt.Println("Bucket versioning enabled with directory:", verioningdirAbs)
+	if versioningdirAbs != "" {
+		fmt.Println("Bucket versioning enabled with directory:", versioningdirAbs)
 	}
 
 	if sidecardirAbs != "" {
@@ -180,18 +220,29 @@ func New(rootdir string, meta meta.MetadataStorer, opts PosixOpts) (*Posix, erro
 	}
 
 	return &Posix{
-		meta:           meta,
-		rootfd:         f,
-		rootdir:        rootdir,
-		euid:           os.Geteuid(),
-		egid:           os.Getegid(),
-		chownuid:       opts.ChownUID,
-		chowngid:       opts.ChownGID,
-		bucketlinks:    opts.BucketLinks,
-		versioningDir:  verioningdirAbs,
-		newDirPerm:     opts.NewDirPerm,
-		forceNoTmpFile: opts.ForceNoTmpFile,
+		meta:                 meta,
+		rootfd:               f,
+		rootdir:              rootdir,
+		euid:                 os.Geteuid(),
+		egid:                 os.Getegid(),
+		chownuid:             opts.ChownUID,
+		chowngid:             opts.ChownGID,
+		bucketlinks:          opts.BucketLinks,
+		versioningDir:        versioningdirAbs,
+		newDirPerm:           opts.NewDirPerm,
+		forceNoTmpFile:       opts.ForceNoTmpFile,
+		forceNoCopyFileRange: opts.ForceNoCopyFileRange,
+		validateBucketName:   opts.ValidateBucketNames,
+		actionLimiter:        semaphore.NewWeighted(int64(concurrencyOrDefault(opts.Concurrency))),
 	}, nil
+}
+
+// concurrencyOrDefault returns n if it is positive, otherwise defaultConcurrency.
+func concurrencyOrDefault(n int) int {
+	if n > 0 {
+		return n
+	}
+	return defaultConcurrency
 }
 
 func validateSubDir(root, dir string) (string, error) {
@@ -244,6 +295,40 @@ func (p *Posix) String() string {
 	return "Posix Gateway"
 }
 
+// define a private key type
+type ctxKey int
+
+const (
+	ctxKeyNoAcquireSlot ctxKey = iota
+)
+
+// withCtxNoSlot is a context wrapper with ctxKeyNoAcquireSlot key
+func withCtxNoSlot(ctx context.Context) context.Context {
+	return context.WithValue(ctx, ctxKeyNoAcquireSlot, struct{}{})
+}
+
+// acquireActionSlot reserves a concurrency slot for an action
+// it blocks until a slot is available or the context is canceled.
+// On success, it returns a releaser that must be called to free the slot.
+// If ctxKeyNoAcquireSlot is set in the context, the limiter is bypassed
+// and a no-op releaser is returned.
+func (p *Posix) acquireActionSlot(ctx context.Context) (func(), error) {
+	// if no acquire lock is set, do not reserve a slot
+	// and return a blank releaser
+	val := ctx.Value(ctxKeyNoAcquireSlot)
+	if val != nil {
+		return func() {}, nil
+	}
+
+	if err := p.actionLimiter.Acquire(ctx, 1); err != nil {
+		return nil, err
+	}
+
+	return func() {
+		p.actionLimiter.Release(1)
+	}, nil
+}
+
 // returns the versioning state
 func (p *Posix) versioningEnabled() bool {
 	return p.versioningDir != ""
@@ -269,7 +354,13 @@ func (p *Posix) doesBucketAndObjectExist(bucket, object string) error {
 	return nil
 }
 
-func (p *Posix) ListBuckets(_ context.Context, input s3response.ListBucketsInput) (s3response.ListAllMyBucketsResult, error) {
+func (p *Posix) ListBuckets(ctx context.Context, input s3response.ListBucketsInput) (s3response.ListAllMyBucketsResult, error) {
+	release, err := p.acquireActionSlot(ctx)
+	if err != nil {
+		return s3response.ListAllMyBucketsResult{}, err
+	}
+	defer release()
+
 	fis, err := listBucketFileInfos(p.bucketlinks)
 	if err != nil {
 		return s3response.ListAllMyBucketsResult{}, fmt.Errorf("listBucketFileInfos : %w", err)
@@ -280,6 +371,10 @@ func (p *Posix) ListBuckets(_ context.Context, input s3response.ListBucketsInput
 	var buckets []s3response.ListAllMyBucketsEntry
 	for _, fi := range fis {
 		if !strings.HasPrefix(fi.Name(), input.Prefix) {
+			continue
+		}
+
+		if !utils.IsValidBucketName(fi.Name()) {
 			continue
 		}
 
@@ -335,8 +430,24 @@ func (p *Posix) ListBuckets(_ context.Context, input s3response.ListBucketsInput
 	}, nil
 }
 
-func (p *Posix) HeadBucket(_ context.Context, input *s3.HeadBucketInput) (*s3.HeadBucketOutput, error) {
-	_, err := os.Lstat(*input.Bucket)
+func (p *Posix) isBucketValid(bucket string) bool {
+	if !p.validateBucketName {
+		return true
+	}
+
+	return backend.IsValidDirectoryName(bucket)
+}
+
+func (p *Posix) HeadBucket(ctx context.Context, input *s3.HeadBucketInput) (*s3.HeadBucketOutput, error) {
+	release, err := p.acquireActionSlot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	if !p.isBucketValid(*input.Bucket) {
+		return nil, s3err.GetAPIError(s3err.ErrInvalidBucketName)
+	}
+	_, err = os.Lstat(*input.Bucket)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, s3err.GetAPIError(s3err.ErrNoSuchBucket)
 	}
@@ -348,7 +459,13 @@ func (p *Posix) HeadBucket(_ context.Context, input *s3.HeadBucketInput) (*s3.He
 }
 
 func (p *Posix) CreateBucket(ctx context.Context, input *s3.CreateBucketInput, acl []byte) error {
-	acct, ok := ctx.Value("account").(auth.Account)
+	release, err := p.acquireActionSlot(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	acct, ok := ctx.Value("bucket-owner").(auth.Account)
 	if !ok {
 		acct = auth.Account{}
 	}
@@ -357,7 +474,16 @@ func (p *Posix) CreateBucket(ctx context.Context, input *s3.CreateBucketInput, a
 
 	bucket := *input.Bucket
 
-	err := os.Mkdir(bucket, p.newDirPerm)
+	if !p.isBucketValid(bucket) {
+		return s3err.GetAPIError(s3err.ErrInvalidBucketName)
+	}
+
+	tagging, err := backend.ParseCreateBucketTags(input.CreateBucketConfiguration.Tags)
+	if err != nil {
+		return err
+	}
+
+	err = os.Mkdir(bucket, p.newDirPerm)
 	if err != nil && os.IsExist(err) {
 		aclJSON, err := p.meta.RetrieveAttribute(nil, bucket, "", aclkey)
 		if err != nil {
@@ -396,12 +522,22 @@ func (p *Posix) CreateBucket(ctx context.Context, input *s3.CreateBucketInput, a
 	if err != nil {
 		return fmt.Errorf("set ownership: %w", err)
 	}
+	if tagging != nil {
+		tags, err := json.Marshal(tagging)
+		if err != nil {
+			return fmt.Errorf("marshal tags: %w", err)
+		}
+		err = p.meta.StoreAttribute(nil, bucket, "", tagHdr, tags)
+		if err != nil {
+			return fmt.Errorf("set tags: %w", err)
+		}
+	}
 
 	if input.ObjectLockEnabledForBucket != nil && *input.ObjectLockEnabledForBucket {
 		// First enable bucket versioning
 		// Bucket versioning is enabled automatically with object lock
 		if p.versioningEnabled() {
-			err = p.PutBucketVersioning(ctx, bucket, types.BucketVersioningStatusEnabled)
+			err = p.PutBucketVersioning(withCtxNoSlot(ctx), bucket, types.BucketVersioningStatusEnabled)
 			if err != nil {
 				return err
 			}
@@ -458,9 +594,18 @@ func (p *Posix) isBucketEmpty(bucket string) error {
 	return nil
 }
 
-func (p *Posix) DeleteBucket(_ context.Context, bucket string) error {
+func (p *Posix) DeleteBucket(ctx context.Context, bucket string) error {
+	release, err := p.acquireActionSlot(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	if !p.isBucketValid(bucket) {
+		return s3err.GetAPIError(s3err.ErrInvalidBucketName)
+	}
 	// Check if the bucket is empty
-	err := p.isBucketEmpty(bucket)
+	err = p.isBucketEmpty(bucket)
 	if err != nil {
 		return err
 	}
@@ -481,8 +626,17 @@ func (p *Posix) DeleteBucket(_ context.Context, bucket string) error {
 	return nil
 }
 
-func (p *Posix) PutBucketOwnershipControls(_ context.Context, bucket string, ownership types.ObjectOwnership) error {
-	_, err := os.Stat(bucket)
+func (p *Posix) PutBucketOwnershipControls(ctx context.Context, bucket string, ownership types.ObjectOwnership) error {
+	release, err := p.acquireActionSlot(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	if !p.isBucketValid(bucket) {
+		return s3err.GetAPIError(s3err.ErrInvalidBucketName)
+	}
+	_, err = os.Stat(bucket)
 	if errors.Is(err, fs.ErrNotExist) {
 		return s3err.GetAPIError(s3err.ErrNoSuchBucket)
 	}
@@ -497,9 +651,18 @@ func (p *Posix) PutBucketOwnershipControls(_ context.Context, bucket string, own
 
 	return nil
 }
-func (p *Posix) GetBucketOwnershipControls(_ context.Context, bucket string) (types.ObjectOwnership, error) {
+func (p *Posix) GetBucketOwnershipControls(ctx context.Context, bucket string) (types.ObjectOwnership, error) {
+	release, err := p.acquireActionSlot(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer release()
+
 	var ownship types.ObjectOwnership
-	_, err := os.Stat(bucket)
+	if !p.isBucketValid(bucket) {
+		return ownship, s3err.GetAPIError(s3err.ErrInvalidBucketName)
+	}
+	_, err = os.Stat(bucket)
 	if errors.Is(err, fs.ErrNotExist) {
 		return ownship, s3err.GetAPIError(s3err.ErrNoSuchBucket)
 	}
@@ -517,8 +680,17 @@ func (p *Posix) GetBucketOwnershipControls(_ context.Context, bucket string) (ty
 
 	return types.ObjectOwnership(ownership), nil
 }
-func (p *Posix) DeleteBucketOwnershipControls(_ context.Context, bucket string) error {
-	_, err := os.Stat(bucket)
+func (p *Posix) DeleteBucketOwnershipControls(ctx context.Context, bucket string) error {
+	release, err := p.acquireActionSlot(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	if !p.isBucketValid(bucket) {
+		return s3err.GetAPIError(s3err.ErrInvalidBucketName)
+	}
+	_, err = os.Stat(bucket)
 	if errors.Is(err, fs.ErrNotExist) {
 		return s3err.GetAPIError(s3err.ErrNoSuchBucket)
 	}
@@ -539,10 +711,19 @@ func (p *Posix) DeleteBucketOwnershipControls(_ context.Context, bucket string) 
 }
 
 func (p *Posix) PutBucketVersioning(ctx context.Context, bucket string, status types.BucketVersioningStatus) error {
+	release, err := p.acquireActionSlot(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	if !p.isBucketValid(bucket) {
+		return s3err.GetAPIError(s3err.ErrInvalidBucketName)
+	}
 	if !p.versioningEnabled() {
 		return s3err.GetAPIError(s3err.ErrVersioningNotConfigured)
 	}
-	_, err := os.Stat(bucket)
+	_, err = os.Stat(bucket)
 	if errors.Is(err, fs.ErrNotExist) {
 		return s3err.GetAPIError(s3err.ErrNoSuchBucket)
 	}
@@ -557,7 +738,7 @@ func (p *Posix) PutBucketVersioning(ctx context.Context, bucket string, status t
 		// '1' maps to 'Enabled'
 		versioning = []byte{1}
 	case types.BucketVersioningStatusSuspended:
-		lockRaw, err := p.GetObjectLockConfiguration(ctx, bucket)
+		lockRaw, err := p.GetObjectLockConfiguration(withCtxNoSlot(ctx), bucket)
 		if err != nil && !errors.Is(err, s3err.GetAPIError(s3err.ErrObjectLockConfigurationNotFound)) {
 			return err
 		}
@@ -583,12 +764,22 @@ func (p *Posix) PutBucketVersioning(ctx context.Context, bucket string, status t
 	return nil
 }
 
-func (p *Posix) GetBucketVersioning(_ context.Context, bucket string) (s3response.GetBucketVersioningOutput, error) {
+func (p *Posix) GetBucketVersioning(ctx context.Context, bucket string) (s3response.GetBucketVersioningOutput, error) {
+	release, err := p.acquireActionSlot(ctx)
+	if err != nil {
+		return s3response.GetBucketVersioningOutput{}, err
+	}
+	defer release()
+
 	if !p.versioningEnabled() {
 		return s3response.GetBucketVersioningOutput{}, s3err.GetAPIError(s3err.ErrVersioningNotConfigured)
 	}
 
-	_, err := os.Stat(bucket)
+	if !p.isBucketValid(bucket) {
+		return s3response.GetBucketVersioningOutput{}, s3err.GetAPIError(s3err.ErrInvalidBucketName)
+	}
+
+	_, err = os.Stat(bucket)
 	if errors.Is(err, fs.ErrNotExist) {
 		return s3response.GetBucketVersioningOutput{}, s3err.GetAPIError(s3err.ErrNoSuchBucket)
 	}
@@ -620,11 +811,11 @@ func (p *Posix) GetBucketVersioning(_ context.Context, bucket string) (s3respons
 
 // Returns the specified bucket versioning status
 func (p *Posix) getBucketVersioningStatus(ctx context.Context, bucket string) (types.BucketVersioningStatus, error) {
-	res, err := p.GetBucketVersioning(ctx, bucket)
+	res, err := p.GetBucketVersioning(withCtxNoSlot(ctx), bucket)
 	if errors.Is(err, s3err.GetAPIError(s3err.ErrVersioningNotConfigured)) {
 		return "", nil
 	}
-	if err != nil && !errors.Is(err, s3err.GetAPIError(s3err.ErrVersioningNotConfigured)) {
+	if err != nil {
 		return "", err
 	}
 
@@ -669,8 +860,17 @@ func (p *Posix) deleteNullVersionIdObject(bucket, key string) error {
 	return err
 }
 
+func isRemovableAttr(attr string) bool {
+	switch attr {
+	case objectLegalHoldKey, objectRetentionKey:
+		return true
+	default:
+		return false
+	}
+}
+
 // Creates a new copy(version) of an object in the versioning directory
-func (p *Posix) createObjVersion(bucket, key string, size int64, acc auth.Account) (versionPath string, err error) {
+func (p *Posix) createObjVersion(bucket, key string, size int64, acc auth.Account, removeAttributes bool) (versionPath string, err error) {
 	sf, err := os.Open(filepath.Join(bucket, key))
 	if err != nil {
 		return "", err
@@ -726,6 +926,14 @@ func (p *Posix) createObjVersion(bucket, key string, size int64, acc auth.Accoun
 		if err != nil {
 			return versionPath, fmt.Errorf("store %v attribute: %w", attr, err)
 		}
+
+		// remove object lock attributes in delete marker
+		if removeAttributes && isRemovableAttr(attr) {
+			err := p.meta.DeleteAttribute(bucket, key, attr)
+			if err != nil {
+				return versionPath, fmt.Errorf("remove %s attribute: %w", attr, err)
+			}
+		}
 	}
 
 	if err := f.link(); err != nil {
@@ -736,9 +944,19 @@ func (p *Posix) createObjVersion(bucket, key string, size int64, acc auth.Accoun
 }
 
 func (p *Posix) ListObjectVersions(ctx context.Context, input *s3.ListObjectVersionsInput) (s3response.ListVersionsResult, error) {
+	release, err := p.acquireActionSlot(ctx)
+	if err != nil {
+		return s3response.ListVersionsResult{}, err
+	}
+	defer release()
+
 	bucket := *input.Bucket
 	var prefix, delim, keyMarker, versionIdMarker string
 	var max int
+
+	if !p.isBucketValid(bucket) {
+		return s3response.ListVersionsResult{}, s3err.GetAPIError(s3err.ErrInvalidBucketName)
+	}
 
 	if input.Prefix != nil {
 		prefix = *input.Prefix
@@ -756,7 +974,7 @@ func (p *Posix) ListObjectVersions(ctx context.Context, input *s3.ListObjectVers
 		max = int(*input.MaxKeys)
 	}
 
-	_, err := os.Stat(bucket)
+	_, err = os.Stat(bucket)
 	if errors.Is(err, fs.ErrNotExist) {
 		return s3response.ListVersionsResult{}, s3err.GetAPIError(s3err.ErrNoSuchBucket)
 	}
@@ -789,6 +1007,30 @@ func (p *Posix) ListObjectVersions(ctx context.Context, input *s3.ListObjectVers
 
 func getBoolPtr(b bool) *bool {
 	return &b
+}
+
+// ensureNotDeleteMarker return a `MethodNotAllowd` error
+// if the provided object(version) is a delete marker
+func (p *Posix) ensureNotDeleteMarker(bucket, object, versionId string) error {
+	if !p.versioningEnabled() {
+		return nil
+	}
+
+	_, err := p.meta.RetrieveAttribute(nil, bucket, object, deleteMarkerKey)
+	if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+		if versionId != "" {
+			return s3err.GetAPIError(s3err.ErrNoSuchVersion)
+		}
+		return s3err.GetAPIError(s3err.ErrNoSuchKey)
+	}
+	if errors.Is(err, meta.ErrNoSuchKey) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("get delete marker attr: %w", err)
+	}
+
+	return s3err.GetAPIError(s3err.ErrMethodNotAllowed)
 }
 
 // Check if the given object is a delete marker
@@ -908,7 +1150,7 @@ func (p *Posix) fileToObjVersions(bucket string) backend.GetVersionsFunc {
 					Key:          &path,
 				})
 			} else {
-				// Retreive checksum
+				// Retrieve checksum
 				checksum, err := p.retrieveChecksums(nil, bucket, path)
 				if err != nil && !errors.Is(err, meta.ErrNoSuchKey) {
 					return nil, fmt.Errorf("get checksum: %w", err)
@@ -999,7 +1241,7 @@ func (p *Posix) fileToObjVersions(bucket string) backend.GetVersionsFunc {
 				// so this will just set etag to "" if its not already set
 				etag := string(etagBytes)
 				size := nf.Size()
-				// Retreive checksum
+				// Retrieve checksum
 				checksum, err := p.retrieveChecksums(nil, versionPath, nullVersionId)
 				if err != nil && !errors.Is(err, meta.ErrNoSuchKey) {
 					return nil, fmt.Errorf("get checksum: %w", err)
@@ -1121,7 +1363,7 @@ func (p *Posix) fileToObjVersions(bucket string) backend.GetVersionsFunc {
 					IsLatest:     getBoolPtr(false),
 				})
 			} else {
-				// Retreive checksum
+				// Retrieve checksum
 				checksum, err := p.retrieveChecksums(nil, versionPath, versionId)
 				if err != nil && !errors.Is(err, meta.ErrNoSuchKey) {
 					return nil, fmt.Errorf("get checksum: %w", err)
@@ -1179,6 +1421,12 @@ func (p *Posix) fileToObjVersions(bucket string) backend.GetVersionsFunc {
 }
 
 func (p *Posix) CreateMultipartUpload(ctx context.Context, mpu s3response.CreateMultipartUploadInput) (s3response.InitiateMultipartUploadResult, error) {
+	release, err := p.acquireActionSlot(ctx)
+	if err != nil {
+		return s3response.InitiateMultipartUploadResult{}, err
+	}
+	defer release()
+
 	if mpu.Key == nil {
 		return s3response.InitiateMultipartUploadResult{}, s3err.GetAPIError(s3err.ErrNoSuchKey)
 	}
@@ -1186,7 +1434,11 @@ func (p *Posix) CreateMultipartUpload(ctx context.Context, mpu s3response.Create
 	bucket := *mpu.Bucket
 	object := *mpu.Key
 
-	_, err := os.Stat(bucket)
+	if !p.isBucketValid(bucket) {
+		return s3response.InitiateMultipartUploadResult{}, s3err.GetAPIError(s3err.ErrInvalidBucketName)
+	}
+
+	_, err = os.Stat(bucket)
 	if errors.Is(err, fs.ErrNotExist) {
 		return s3response.InitiateMultipartUploadResult{}, s3err.GetAPIError(s3err.ErrNoSuchBucket)
 	}
@@ -1195,7 +1447,7 @@ func (p *Posix) CreateMultipartUpload(ctx context.Context, mpu s3response.Create
 	}
 
 	if strings.HasSuffix(*mpu.Key, "/") {
-		// directory objects can't be uploaded with mutlipart uploads
+		// directory objects can't be uploaded with multipart uploads
 		// because posix directories can't contain data
 		return s3response.InitiateMultipartUploadResult{}, s3err.GetAPIError(s3err.ErrDirectoryObjectContainsData)
 	}
@@ -1233,21 +1485,9 @@ func (p *Posix) CreateMultipartUpload(ctx context.Context, mpu s3response.Create
 		return s3response.InitiateMultipartUploadResult{}, fmt.Errorf("set name attr for upload: %w", err)
 	}
 
-	// set user metadata
-	for k, v := range mpu.Metadata {
-		err := p.meta.StoreAttribute(nil, bucket, filepath.Join(objdir, uploadID),
-			fmt.Sprintf("%v.%v", metaHdr, k), []byte(v))
-		if err != nil {
-			// cleanup object if returning error
-			os.RemoveAll(filepath.Join(tmppath, uploadID))
-			os.Remove(tmppath)
-			return s3response.InitiateMultipartUploadResult{}, fmt.Errorf("set user attr %q: %w", k, err)
-		}
-	}
-
 	// set object tagging
 	if tags != nil {
-		err := p.PutObjectTagging(ctx, bucket, filepath.Join(objdir, uploadID), tags)
+		err := p.PutObjectTagging(withCtxNoSlot(ctx), bucket, filepath.Join(objdir, uploadID), "", tags)
 		if err != nil {
 			// cleanup object if returning error
 			os.RemoveAll(filepath.Join(tmppath, uploadID))
@@ -1256,14 +1496,16 @@ func (p *Posix) CreateMultipartUpload(ctx context.Context, mpu s3response.Create
 		}
 	}
 
-	err = p.storeObjectMetadata(nil, bucket, filepath.Join(objdir, uploadID), objectMetadata{
-		ContentType:        mpu.ContentType,
-		ContentEncoding:    mpu.ContentEncoding,
-		ContentDisposition: mpu.ContentDisposition,
-		ContentLanguage:    mpu.ContentLanguage,
-		CacheControl:       mpu.CacheControl,
-		Expires:            mpu.Expires,
-	})
+	err = p.storeObjectMetaProperties(nil, bucket, filepath.Join(objdir, uploadID),
+		metaProperties{
+			ContentType:        mpu.ContentType,
+			ContentEncoding:    mpu.ContentEncoding,
+			ContentDisposition: mpu.ContentDisposition,
+			ContentLanguage:    mpu.ContentLanguage,
+			CacheControl:       mpu.CacheControl,
+			Expires:            mpu.Expires,
+			Metadata:           mpu.Metadata,
+		})
 	if err != nil {
 		// cleanup object if returning error
 		os.RemoveAll(filepath.Join(tmppath, uploadID))
@@ -1273,8 +1515,11 @@ func (p *Posix) CreateMultipartUpload(ctx context.Context, mpu s3response.Create
 
 	// set object legal hold
 	if mpu.ObjectLockLegalHoldStatus == types.ObjectLockLegalHoldStatusOn {
-		err := p.PutObjectLegalHold(ctx, bucket, filepath.Join(objdir, uploadID), "", true)
+		err := p.PutObjectLegalHold(withCtxNoSlot(ctx), bucket, filepath.Join(objdir, uploadID), "", true)
 		if err != nil {
+			if errors.Is(err, s3err.GetAPIError(s3err.ErrMissingObjectLockConfiguration)) {
+				err = s3err.GetAPIError(s3err.ErrMissingObjectLockConfigurationNoSpaces)
+			}
 			// cleanup object if returning error
 			os.RemoveAll(filepath.Join(tmppath, uploadID))
 			os.Remove(tmppath)
@@ -1295,8 +1540,11 @@ func (p *Posix) CreateMultipartUpload(ctx context.Context, mpu s3response.Create
 			os.Remove(tmppath)
 			return s3response.InitiateMultipartUploadResult{}, fmt.Errorf("parse object lock retention: %w", err)
 		}
-		err = p.PutObjectRetention(ctx, bucket, filepath.Join(objdir, uploadID), "", true, retParsed)
+		err = p.PutObjectRetention(withCtxNoSlot(ctx), bucket, filepath.Join(objdir, uploadID), "", retParsed)
 		if err != nil {
+			if errors.Is(err, s3err.GetAPIError(s3err.ErrMissingObjectLockConfiguration)) {
+				err = s3err.GetAPIError(s3err.ErrMissingObjectLockConfigurationNoSpaces)
+			}
 			// cleanup object if returning error
 			os.RemoveAll(filepath.Join(tmppath, uploadID))
 			os.Remove(tmppath)
@@ -1362,16 +1610,33 @@ func getPartChecksum(algo types.ChecksumAlgorithm, part types.CompletedPart) str
 }
 
 func (p *Posix) CompleteMultipartUpload(ctx context.Context, input *s3.CompleteMultipartUploadInput) (s3response.CompleteMultipartUploadResult, string, error) {
+	release, err := p.acquireActionSlot(ctx)
+	if err != nil {
+		return s3response.CompleteMultipartUploadResult{}, "", err
+	}
+	defer release()
+
 	return p.CompleteMultipartUploadWithCopy(ctx, input, nil)
 }
 
-func (p *Posix) CompleteMultipartUploadWithCopy(ctx context.Context, input *s3.CompleteMultipartUploadInput, customMove func(from *os.File, to *os.File) error) (s3response.CompleteMultipartUploadResult, string, error) {
+type onlyRead struct {
+	io.Reader
+}
+
+// CustomCopyFunc implements copying/moving data from one file descriptor
+// to another. The bool return signifies if function is idempotent. If true
+// the system will allow clients to retry CompleteMultipartUpload. If
+// false, then once a copy function is called successfully the upload will
+// be completely aborted on any subsequent failure.
+type CustomCopyFunc func(from *os.File, to *os.File) (bool, error)
+
+func (p *Posix) CompleteMultipartUploadWithCopy(ctx context.Context, input *s3.CompleteMultipartUploadInput, customCopy CustomCopyFunc) (s3response.CompleteMultipartUploadResult, string, error) {
 	acct, ok := ctx.Value("account").(auth.Account)
 	if !ok {
 		acct = auth.Account{}
 	}
 
-	var res s3response.CompleteMultipartUploadResult
+	res := s3response.CompleteMultipartUploadResult{}
 
 	if input.Key == nil {
 		return res, "", s3err.GetAPIError(s3err.ErrNoSuchKey)
@@ -1388,6 +1653,10 @@ func (p *Posix) CompleteMultipartUploadWithCopy(ctx context.Context, input *s3.C
 	uploadID := *input.UploadId
 	parts := input.MultipartUpload.Parts
 
+	if !p.isBucketValid(bucket) {
+		return res, "", s3err.GetAPIError(s3err.ErrInvalidBucketName)
+	}
+
 	_, err := os.Stat(bucket)
 	if errors.Is(err, fs.ErrNotExist) {
 		return res, "", s3err.GetAPIError(s3err.ErrNoSuchBucket)
@@ -1402,8 +1671,8 @@ func (p *Posix) CompleteMultipartUploadWithCopy(ctx context.Context, input *s3.C
 	}
 
 	b, err := p.meta.RetrieveAttribute(nil, bucket, object, etagkey)
-	if err == nil {
-		err = backend.EvaluateMatchPreconditions(string(b), input.IfMatch, input.IfNoneMatch)
+	if err == nil || errors.Is(err, fs.ErrNotExist) || errors.Is(err, meta.ErrNoSuchKey) {
+		err = backend.EvaluateObjectPutPreconditions(string(b), input.IfMatch, input.IfNoneMatch, err == nil)
 		if err != nil {
 			return res, "", err
 		}
@@ -1414,10 +1683,6 @@ func (p *Posix) CompleteMultipartUploadWithCopy(ctx context.Context, input *s3.C
 	checksums, err := p.retrieveChecksums(nil, bucket, filepath.Join(objdir, uploadID))
 	if err != nil && !errors.Is(err, meta.ErrNoSuchKey) {
 		return res, "", fmt.Errorf("get mp checksums: %w", err)
-	}
-	var checksumAlgorithm types.ChecksumAlgorithm
-	if checksums.Algorithm != "" {
-		checksumAlgorithm = checksums.Algorithm
 	}
 
 	// ChecksumType should be the same as specified on CreateMultipartUpload
@@ -1430,15 +1695,18 @@ func (p *Posix) CompleteMultipartUploadWithCopy(ctx context.Context, input *s3.C
 		return res, "", s3err.GetChecksumTypeMismatchOnMpErr(checksumType)
 	}
 
+	// mpChecksumType holds the multipart upload checksum type
+	mpChecksumType := checksums.Type
+
+	// The checksum type/algorithm should default to FULL_OBJECT(crc64nvme)
+	if checksums.Type == "" {
+		checksums.Type = types.ChecksumTypeFullObject
+		checksums.Algorithm = types.ChecksumAlgorithmCrc64nvme
+	}
+
 	// check all parts ok
 	last := len(parts) - 1
 	var totalsize int64
-
-	var composableCRC bool
-	switch checksums.Type {
-	case types.ChecksumTypeFullObject:
-		composableCRC = utils.IsChecksumComposable(checksumAlgorithm)
-	}
 
 	// The initialie values is the lower limit of partNumber: 0
 	var partNumber int32
@@ -1483,7 +1751,7 @@ func (p *Posix) CompleteMultipartUploadWithCopy(ctx context.Context, input *s3.C
 			return res, "", fmt.Errorf("get part checksum: %w", err)
 		}
 
-		// If checksum has been provided on mp initalization
+		// If checksum has been provided on mp initialization
 		err = validatePartChecksum(partChecksum, part)
 		if err != nil {
 			return res, "", err
@@ -1494,18 +1762,10 @@ func (p *Posix) CompleteMultipartUploadWithCopy(ctx context.Context, input *s3.C
 		return res, "", s3err.GetIncorrectMpObjectSizeErr(totalsize, *input.MpuObjectSize)
 	}
 
-	var hashRdr *utils.HashReader
 	var compositeChecksumRdr *utils.CompositeChecksumReader
-	switch checksums.Type {
-	case types.ChecksumTypeFullObject:
-		if !composableCRC {
-			hashRdr, err = utils.NewHashReader(nil, "", utils.HashType(strings.ToLower(string(checksumAlgorithm))))
-			if err != nil {
-				return res, "", fmt.Errorf("initialize hash reader: %w", err)
-			}
-		}
-	case types.ChecksumTypeComposite:
-		compositeChecksumRdr, err = utils.NewCompositeChecksumReader(utils.HashType(strings.ToLower(string(checksumAlgorithm))))
+	if checksums.Type == types.ChecksumTypeComposite {
+		// initialize the composite checksum reader if the mp checksum type is COMPOSITE
+		compositeChecksumRdr, err = utils.NewCompositeChecksumReader(utils.HashType(strings.ToLower(string(checksums.Algorithm))))
 		if err != nil {
 			return res, "", fmt.Errorf("initialize composite checksum reader: %w", err)
 		}
@@ -1522,6 +1782,7 @@ func (p *Posix) CompleteMultipartUploadWithCopy(ctx context.Context, input *s3.C
 	defer f.cleanup()
 
 	var composableCsum string
+	var abortOnErrSet bool
 	for i, part := range parts {
 		partObjPath := filepath.Join(objdir, uploadID, fmt.Sprintf("%v", *part.PartNumber))
 		fullPartPath := filepath.Join(bucket, partObjPath)
@@ -1535,28 +1796,35 @@ func (p *Posix) CompleteMultipartUploadWithCopy(ctx context.Context, input *s3.C
 			return res, "", fmt.Errorf("stat part %v: %v", *part.PartNumber, err)
 		}
 
-		var rdr io.Reader = pf
 		switch checksums.Type {
 		case types.ChecksumTypeFullObject:
-			if composableCRC {
-				if i == 0 {
-					composableCsum = getPartChecksum(checksumAlgorithm, part)
-					break
-				}
-				composableCsum, err = utils.AddCRCChecksum(checksumAlgorithm,
-					composableCsum, getPartChecksum(checksumAlgorithm, part),
-					pfi.Size())
+			var partChecksum string
+			if mpChecksumType != "" {
+				// if any checksum has been initially specified on mp creation
+				// read the part checksum configuration
+				partChecksum = getPartChecksum(checksums.Algorithm, part)
+			} else {
+				// if no checksum has been specified on mp creation
+				// retrieve the internally stored crc64nvme
+				crc64nvme, err := p.meta.RetrieveAttribute(pf, bucket, partObjPath, partCrc64nvme)
 				if err != nil {
 					pf.Close()
-					return res, "", fmt.Errorf("add part %v checksum: %w",
-						*part.PartNumber, err)
+					return res, "", fmt.Errorf("retrieve part internal crc64nvme: %w", err)
 				}
+				partChecksum = string(crc64nvme)
+			}
+			if i == 0 {
+				composableCsum = partChecksum
 				break
 			}
-			hashRdr.SetReader(rdr)
-			rdr = hashRdr
+			composableCsum, err = utils.AddCRCChecksum(checksums.Algorithm, composableCsum, partChecksum, pfi.Size())
+			if err != nil {
+				pf.Close()
+				return res, "", fmt.Errorf("add part %v checksum: %w",
+					*part.PartNumber, err)
+			}
 		case types.ChecksumTypeComposite:
-			err := compositeChecksumRdr.Process(getPartChecksum(checksumAlgorithm, part))
+			err := compositeChecksumRdr.Process(getPartChecksum(checksums.Algorithm, part))
 			if err != nil {
 				pf.Close()
 				return res, "", fmt.Errorf("process %v part checksum: %w",
@@ -1564,17 +1832,42 @@ func (p *Posix) CompleteMultipartUploadWithCopy(ctx context.Context, input *s3.C
 			}
 		}
 
-		if customMove != nil {
-			err = customMove(pf, f.File())
+		if customCopy != nil {
+			idemp, err := customCopy(pf, f.File())
 			if err != nil {
 				// Fail back to standard copy
-				debuglogger.Logf("Custom data block move failed (%w), failing back to io.Copy()", err)
+				debuglogger.Logf("custom data block move failed (%q/%q): %v, failing back to io.Copy()",
+					bucket, object, err)
 				fw := f.File()
 				fw.Seek(0, io.SeekEnd)
-				_, err = io.Copy(fw, rdr)
+				if p.forceNoCopyFileRange {
+					_, err = io.Copy(fw, &onlyRead{pf})
+				} else {
+					_, err = io.Copy(fw, pf)
+				}
+			}
+			if !idemp && err == nil {
+				// a successful non-idempotent call means we can no longer
+				// retry this upload. any failure needs to abort the complete
+				// upload.
+				if !abortOnErrSet {
+					defer func() {
+						// cleanup tmp dirs
+						os.RemoveAll(filepath.Join(bucket, objdir, uploadID))
+						// use Remove for objdir in case there are still other
+						// uploads for same object name outstanding, this will
+						// fail if there are any
+						os.Remove(filepath.Join(bucket, objdir))
+					}()
+				}
+				abortOnErrSet = true
 			}
 		} else {
-			_, err = io.Copy(f.File(), rdr)
+			if p.forceNoCopyFileRange {
+				_, err = io.Copy(f.File(), &onlyRead{pf})
+			} else {
+				_, err = io.Copy(f.File(), pf)
+			}
 		}
 		pf.Close()
 		if err != nil {
@@ -1587,9 +1880,8 @@ func (p *Posix) CompleteMultipartUploadWithCopy(ctx context.Context, input *s3.C
 
 	upiddir := filepath.Join(objdir, uploadID)
 
-	userMetaData := make(map[string]string)
-	objMeta := p.loadObjectMetaData(nil, bucket, upiddir, nil, userMetaData)
-	err = p.storeObjectMetadata(f.File(), bucket, object, objMeta)
+	objMeta := p.loadObjectMetaProperties(nil, bucket, upiddir, nil)
+	err = p.storeObjectMetaProperties(f.File(), bucket, object, objMeta)
 	if err != nil {
 		return res, "", err
 	}
@@ -1612,9 +1904,9 @@ func (p *Posix) CompleteMultipartUploadWithCopy(ctx context.Context, input *s3.C
 
 	d, err := os.Stat(objname)
 
-	// if the versioninng is enabled first create the file object version
+	// if the versioning is enabled first create the file object version
 	if p.versioningEnabled() && vEnabled && err == nil && !d.IsDir() {
-		_, err := p.createObjVersion(bucket, object, d.Size(), acct)
+		_, err := p.createObjVersion(bucket, object, d.Size(), acct, false)
 		if err != nil {
 			return res, "", fmt.Errorf("create object version: %w", err)
 		}
@@ -1628,13 +1920,6 @@ func (p *Posix) CompleteMultipartUploadWithCopy(ctx context.Context, input *s3.C
 		err := p.meta.StoreAttribute(f.File(), bucket, object, versionIdKey, []byte(versionID))
 		if err != nil {
 			return res, "", fmt.Errorf("set versionId attr: %w", err)
-		}
-	}
-
-	for k, v := range userMetaData {
-		err = p.meta.StoreAttribute(f.File(), bucket, object, fmt.Sprintf("%v.%v", metaHdr, k), []byte(v))
-		if err != nil {
-			return res, "", fmt.Errorf("set user attr %q: %w", k, err)
 		}
 	}
 
@@ -1668,61 +1953,56 @@ func (p *Posix) CompleteMultipartUploadWithCopy(ctx context.Context, input *s3.C
 	var sha256 *string
 	var crc64nvme *string
 
-	// Calculate, compare with the provided checksum and store them
-	if checksums.Type != "" {
-		checksum := s3response.Checksum{
-			Algorithm: checksumAlgorithm,
-			Type:      checksums.Type,
+	var value string
+	switch checksums.Type {
+	case types.ChecksumTypeComposite:
+		value = fmt.Sprintf("%s-%v", compositeChecksumRdr.Sum(), len(parts))
+	case types.ChecksumTypeFullObject:
+		value = composableCsum
+	}
+
+	var gotSum *string
+
+	switch checksums.Algorithm {
+	case types.ChecksumAlgorithmCrc32:
+		gotSum = input.ChecksumCRC32
+		checksums.CRC32 = &value
+		crc32 = &value
+	case types.ChecksumAlgorithmCrc32c:
+		gotSum = input.ChecksumCRC32C
+		checksums.CRC32C = &value
+		crc32c = &value
+	case types.ChecksumAlgorithmSha1:
+		gotSum = input.ChecksumSHA1
+		checksums.SHA1 = &value
+		sha1 = &value
+	case types.ChecksumAlgorithmSha256:
+		gotSum = input.ChecksumSHA256
+		checksums.SHA256 = &value
+		sha256 = &value
+	case types.ChecksumAlgorithmCrc64nvme:
+		gotSum = input.ChecksumCRC64NVME
+		checksums.CRC64NVME = &value
+		crc64nvme = &value
+	}
+
+	// Check if the provided checksum and the calculated one are the same
+	if mpChecksumType != "" && gotSum != nil {
+		s := *gotSum
+		if checksums.Type == types.ChecksumTypeComposite && !strings.Contains(s, "-") {
+			// if number of parts is not specified in the final checksum
+			// make sure to add, to not fail in the final comparison
+			s = fmt.Sprintf("%s-%v", s, len(parts))
 		}
 
-		var sum string
-		switch checksums.Type {
-		case types.ChecksumTypeComposite:
-			sum = compositeChecksumRdr.Sum()
-		case types.ChecksumTypeFullObject:
-			if !composableCRC {
-				sum = hashRdr.Sum()
-			} else {
-				sum = composableCsum
-			}
+		if s != value {
+			return res, "", s3err.GetChecksumBadDigestErr(checksums.Algorithm)
 		}
+	}
 
-		switch checksumAlgorithm {
-		case types.ChecksumAlgorithmCrc32:
-			if input.ChecksumCRC32 != nil && *input.ChecksumCRC32 != sum {
-				return res, "", s3err.GetChecksumBadDigestErr(checksumAlgorithm)
-			}
-			checksum.CRC32 = &sum
-			crc32 = &sum
-		case types.ChecksumAlgorithmCrc32c:
-			if input.ChecksumCRC32C != nil && *input.ChecksumCRC32C != sum {
-				return res, "", s3err.GetChecksumBadDigestErr(checksumAlgorithm)
-			}
-			checksum.CRC32C = &sum
-			crc32c = &sum
-		case types.ChecksumAlgorithmSha1:
-			if input.ChecksumSHA1 != nil && *input.ChecksumSHA1 != sum {
-				return res, "", s3err.GetChecksumBadDigestErr(checksumAlgorithm)
-			}
-			checksum.SHA1 = &sum
-			sha1 = &sum
-		case types.ChecksumAlgorithmSha256:
-			if input.ChecksumSHA256 != nil && *input.ChecksumSHA256 != sum {
-				return res, "", s3err.GetChecksumBadDigestErr(checksumAlgorithm)
-			}
-			checksum.SHA256 = &sum
-			sha256 = &sum
-		case types.ChecksumAlgorithmCrc64nvme:
-			if input.ChecksumCRC64NVME != nil && *input.ChecksumCRC64NVME != sum {
-				return res, "", s3err.GetChecksumBadDigestErr(checksumAlgorithm)
-			}
-			checksum.CRC64NVME = &sum
-			crc64nvme = &sum
-		}
-		err := p.storeChecksums(f.File(), bucket, object, checksum)
-		if err != nil {
-			return res, "", fmt.Errorf("store object checksum: %w", err)
-		}
+	err = p.storeChecksums(f.File(), bucket, object, checksums)
+	if err != nil {
+		return res, "", fmt.Errorf("store object checksum: %w", err)
 	}
 
 	// load and set retention
@@ -1753,7 +2033,7 @@ func (p *Posix) CompleteMultipartUploadWithCopy(ctx context.Context, input *s3.C
 	// cleanup tmp dirs
 	os.RemoveAll(filepath.Join(bucket, objdir, uploadID))
 	// use Remove for objdir in case there are still other uploads
-	// for same object name outstanding, this will fail if there are
+	// for same object name outstanding, this will fail if there are any
 	os.Remove(filepath.Join(bucket, objdir))
 
 	return s3response.CompleteMultipartUploadResult{
@@ -1861,41 +2141,74 @@ func (p *Posix) checkUploadIDExists(bucket, object, uploadID string) ([32]byte, 
 	return sum, nil
 }
 
-type objectMetadata struct {
+type metaProperties struct {
 	ContentType        *string
 	ContentEncoding    *string
 	ContentDisposition *string
 	ContentLanguage    *string
 	CacheControl       *string
 	Expires            *string
+	Metadata           map[string]string
 }
 
-// fill out the user metadata map with the metadata for the object
-// and return object meta properties as `ObjectMetadata`
-func (p *Posix) loadObjectMetaData(f *os.File, bucket, object string, fi *os.FileInfo, m map[string]string) objectMetadata {
-	ents, err := p.meta.ListAttributes(bucket, object)
-	if err != nil || len(ents) == 0 {
-		return objectMetadata{}
-	}
+// loadObjectMetadata loads the given object metadata, if it fails to load
+// it falls back to the old metadata key -> xattr key mapping mechanism
+// and converts the old metadata storing schema with the new one
+func (p *Posix) loadObjectMetadata(f *os.File, bucket, object string) map[string]string {
+	m, err := p.meta.RetrieveAttribute(f, bucket, object, metadataHdr)
+	if err != nil {
+		if errors.Is(err, meta.ErrNoSuchKey) {
+			// fallback to the deprecated mechanism
+			ents, err := p.meta.ListAttributes(bucket, object)
+			if err != nil || len(ents) == 0 {
+				return nil
+			}
+			result := map[string]string{}
 
-	if m != nil {
-		for _, e := range ents {
-			if !isValidMeta(e) {
-				continue
+			legacyAttrs := make([]string, 0, len(ents))
+			for _, e := range ents {
+				if !isValidMeta(e) {
+					continue
+				}
+				b, err := p.meta.RetrieveAttribute(f, bucket, object, e)
+				if err != nil {
+					continue
+				}
+				if b == nil {
+					b = []byte{}
+				}
+
+				legacyAttrs = append(legacyAttrs, e)
+				result[strings.TrimPrefix(e, fmt.Sprintf("%v.", oldMetaHdr))] = string(b)
 			}
-			b, err := p.meta.RetrieveAttribute(f, bucket, object, e)
-			if err != nil {
-				continue
+
+			if len(result) != 0 {
+				err = p.storeObjectMetadata(f, bucket, object, result)
+				if err == nil {
+					// if it succeded to store the metadata as a json
+					// object in user.metadata, cleanup the legacy X-Amz-Meta.
+					// attributes
+					for _, attr := range legacyAttrs {
+						_ = p.meta.DeleteAttribute(bucket, object, attr)
+					}
+				}
 			}
-			if b == nil {
-				m[strings.TrimPrefix(e, fmt.Sprintf("%v.", metaHdr))] = ""
-				continue
-			}
-			m[strings.TrimPrefix(e, fmt.Sprintf("%v.", metaHdr))] = string(b)
+
+			return result
 		}
+
+		return nil
 	}
 
-	var result objectMetadata
+	var metadata map[string]string
+	_ = json.Unmarshal(m, &metadata)
+	return metadata
+}
+
+// loadObjectMetaProperties loads the given object meta properties
+// including Content-Type, Cache-Control ... and the object Metadata
+func (p *Posix) loadObjectMetaProperties(f *os.File, bucket, object string, fi *os.FileInfo) metaProperties {
+	var result metaProperties
 
 	b, err := p.meta.RetrieveAttribute(f, bucket, object, contentTypeHdr)
 	if err == nil {
@@ -1934,10 +2247,49 @@ func (p *Posix) loadObjectMetaData(f *os.File, bucket, object string, fi *os.Fil
 		result.Expires = backend.GetPtrFromString(string(b))
 	}
 
+	result.Metadata = p.loadObjectMetadata(f, bucket, object)
+
 	return result
 }
 
-func (p *Posix) storeObjectMetadata(f *os.File, bucket, object string, m objectMetadata) error {
+// storeObjectMetadata parses the given metadata map[string]string
+// to raw json to store in file/directory meta storage and checks/cleans up
+// any legacy metadata persent in the object meta storage
+func (p *Posix) storeObjectMetadata(f *os.File, bucket, object string, meta map[string]string) error {
+	if len(meta) == 0 {
+		return nil
+	}
+
+	parsed, err := json.Marshal(meta)
+	if err != nil {
+		return fmt.Errorf("marshal metadata: %w", err)
+	}
+
+	err = p.meta.StoreAttribute(f, bucket, object, metadataHdr, parsed)
+	if err != nil {
+		return err
+	}
+
+	// cleanup any previously set legacy metadata
+	ents, err := p.meta.ListAttributes(bucket, object)
+	if err != nil || len(ents) == 0 {
+		return nil
+	}
+
+	for _, ent := range ents {
+		if !isValidMeta(ent) {
+			continue
+		}
+
+		_ = p.meta.DeleteAttribute(bucket, object, ent)
+	}
+
+	return nil
+}
+
+// storeObjectMetaProperties stores the object meta properties like:
+// Content-Type, Content-Encoding, object Metadata ...
+func (p *Posix) storeObjectMetaProperties(f *os.File, bucket, object string, m metaProperties) error {
 	if getString(m.ContentType) != "" {
 		err := p.meta.StoreAttribute(f, bucket, object, contentTypeHdr, []byte(*m.ContentType))
 		if err != nil {
@@ -1971,7 +2323,13 @@ func (p *Posix) storeObjectMetadata(f *os.File, bucket, object string, m objectM
 	if getString(m.Expires) != "" {
 		err := p.meta.StoreAttribute(f, bucket, object, expiresHdr, []byte(*m.Expires))
 		if err != nil {
-			return fmt.Errorf("set cache-control: %w", err)
+			return fmt.Errorf("set expires: %w", err)
+		}
+	}
+	if m.Metadata != nil {
+		err := p.storeObjectMetadata(f, bucket, object, m.Metadata)
+		if err != nil {
+			return fmt.Errorf("set metadata: %w", err)
 		}
 	}
 
@@ -1979,10 +2337,16 @@ func (p *Posix) storeObjectMetadata(f *os.File, bucket, object string, m objectM
 }
 
 func isValidMeta(val string) bool {
-	return strings.HasPrefix(val, metaHdr)
+	return strings.HasPrefix(val, oldMetaHdr)
 }
 
-func (p *Posix) AbortMultipartUpload(_ context.Context, mpu *s3.AbortMultipartUploadInput) error {
+func (p *Posix) AbortMultipartUpload(ctx context.Context, mpu *s3.AbortMultipartUploadInput) error {
+	release, err := p.acquireActionSlot(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+
 	if mpu.Key == nil {
 		return s3err.GetAPIError(s3err.ErrNoSuchKey)
 	}
@@ -1994,7 +2358,11 @@ func (p *Posix) AbortMultipartUpload(_ context.Context, mpu *s3.AbortMultipartUp
 	object := *mpu.Key
 	uploadID := *mpu.UploadId
 
-	_, err := os.Stat(bucket)
+	if !p.isBucketValid(bucket) {
+		return s3err.GetAPIError(s3err.ErrInvalidBucketName)
+	}
+
+	_, err = os.Stat(bucket)
 	if errors.Is(err, fs.ErrNotExist) {
 		return s3err.GetAPIError(s3err.ErrNoSuchBucket)
 	}
@@ -2025,10 +2393,21 @@ func (p *Posix) AbortMultipartUpload(_ context.Context, mpu *s3.AbortMultipartUp
 	return nil
 }
 
-func (p *Posix) ListMultipartUploads(_ context.Context, mpu *s3.ListMultipartUploadsInput) (s3response.ListMultipartUploadsResult, error) {
+func (p *Posix) ListMultipartUploads(ctx context.Context, mpu *s3.ListMultipartUploadsInput) (s3response.ListMultipartUploadsResult, error) {
+	release, err := p.acquireActionSlot(ctx)
+	if err != nil {
+		return s3response.ListMultipartUploadsResult{}, err
+	}
+	defer release()
+
 	var lmu s3response.ListMultipartUploadsResult
 
 	bucket := *mpu.Bucket
+
+	if !p.isBucketValid(bucket) {
+		return lmu, s3err.GetAPIError(s3err.ErrInvalidBucketName)
+	}
+
 	var delimiter string
 	if mpu.Delimiter != nil {
 		delimiter = *mpu.Delimiter
@@ -2037,8 +2416,17 @@ func (p *Posix) ListMultipartUploads(_ context.Context, mpu *s3.ListMultipartUpl
 	if mpu.Prefix != nil {
 		prefix = *mpu.Prefix
 	}
+	var keyMarker string
+	if mpu.KeyMarker != nil {
+		keyMarker = *mpu.KeyMarker
+	}
+	var uploadIDMarker string
+	if mpu.UploadIdMarker != nil {
+		uploadIDMarker = *mpu.UploadIdMarker
+	}
+	maxUploads := int(*mpu.MaxUploads)
 
-	_, err := os.Stat(bucket)
+	_, err = os.Stat(bucket)
 	if errors.Is(err, fs.ErrNotExist) {
 		return lmu, s3err.GetAPIError(s3err.ErrNoSuchBucket)
 	}
@@ -2050,17 +2438,6 @@ func (p *Posix) ListMultipartUploads(_ context.Context, mpu *s3.ListMultipartUpl
 	objs, _ := os.ReadDir(filepath.Join(bucket, MetaTmpMultipartDir))
 
 	var uploads []s3response.Upload
-	var resultUpds []s3response.Upload
-
-	var keyMarker string
-	if mpu.KeyMarker != nil {
-		keyMarker = *mpu.KeyMarker
-	}
-	var uploadIDMarker string
-	if mpu.UploadIdMarker != nil {
-		uploadIDMarker = *mpu.UploadIdMarker
-	}
-	keyMarkerInd, uploadIdMarkerFound := -1, false
 
 	for _, obj := range objs {
 		if !obj.IsDir() {
@@ -2072,7 +2449,12 @@ func (p *Posix) ListMultipartUploads(_ context.Context, mpu *s3.ListMultipartUpl
 			continue
 		}
 		objectName := string(b)
-		if mpu.Prefix != nil && !strings.HasPrefix(objectName, *mpu.Prefix) {
+		// filter by prefix
+		if prefix != "" && !strings.HasPrefix(objectName, prefix) {
+			continue
+		}
+		// filter by keyMarker
+		if keyMarker != "" && objectName <= keyMarker {
 			continue
 		}
 
@@ -2086,22 +2468,12 @@ func (p *Posix) ListMultipartUploads(_ context.Context, mpu *s3.ListMultipartUpl
 				continue
 			}
 
-			// userMetaData := make(map[string]string)
-			// upiddir := filepath.Join(bucket, metaTmpMultipartDir, obj.Name(), upid.Name())
-			// loadUserMetaData(upiddir, userMetaData)
-
 			fi, err := upid.Info()
 			if err != nil {
 				return lmu, fmt.Errorf("stat %q: %w", upid.Name(), err)
 			}
 
 			uploadID := upid.Name()
-			if !uploadIdMarkerFound && uploadIDMarker == uploadID {
-				uploadIdMarkerFound = true
-			}
-			if keyMarkerInd == -1 && objectName == keyMarker {
-				keyMarkerInd = len(uploads)
-			}
 
 			checksum, err := p.retrieveChecksums(nil, bucket, filepath.Join(MetaTmpMultipartDir, obj.Name(), uploadID))
 			if err != nil && !errors.Is(err, meta.ErrNoSuchKey) {
@@ -2119,65 +2491,41 @@ func (p *Posix) ListMultipartUploads(_ context.Context, mpu *s3.ListMultipartUpl
 		}
 	}
 
-	maxUploads := int(*mpu.MaxUploads)
-	if (uploadIDMarker != "" && !uploadIdMarkerFound) || (keyMarker != "" && keyMarkerInd == -1) {
-		return s3response.ListMultipartUploadsResult{
-			Bucket:         bucket,
-			Delimiter:      delimiter,
-			KeyMarker:      keyMarker,
-			MaxUploads:     maxUploads,
-			Prefix:         prefix,
-			UploadIDMarker: uploadIDMarker,
-			Uploads:        []s3response.Upload{},
-		}, nil
-	}
-
+	// Sort once: Key asc, Initiated asc
 	sort.SliceStable(uploads, func(i, j int) bool {
-		return uploads[i].Key < uploads[j].Key
+		if uploads[i].Key != uploads[j].Key {
+			return uploads[i].Key < uploads[j].Key
+		}
+		return uploads[i].Initiated.Before(uploads[j].Initiated)
 	})
 
-	start := 0
-	if keyMarker != "" {
-		for i, up := range uploads {
-			if up.Key == keyMarker && (uploadIDMarker == "" ||
-				up.UploadID == uploadIDMarker) {
-				// Start after the marker
-				start = i + 1
-				break
-			}
-		}
-	}
-
-	for i := start; i < len(uploads); i++ {
-		if len(resultUpds) == maxUploads {
-			return s3response.ListMultipartUploadsResult{
-				Bucket:             bucket,
-				Delimiter:          delimiter,
-				KeyMarker:          keyMarker,
-				MaxUploads:         maxUploads,
-				NextKeyMarker:      resultUpds[len(resultUpds)-1].Key,
-				NextUploadIDMarker: resultUpds[len(resultUpds)-1].UploadID,
-				IsTruncated:        true,
-				Prefix:             prefix,
-				UploadIDMarker:     uploadIDMarker,
-				Uploads:            resultUpds,
-			}, nil
-		}
-		resultUpds = append(resultUpds, uploads[i])
+	result, err := backend.ListMultipartUploads(uploads, prefix, delimiter, keyMarker, uploadIDMarker, maxUploads)
+	if err != nil {
+		return lmu, err
 	}
 
 	return s3response.ListMultipartUploadsResult{
-		Bucket:         bucket,
-		Delimiter:      delimiter,
-		KeyMarker:      keyMarker,
-		MaxUploads:     maxUploads,
-		Prefix:         prefix,
-		UploadIDMarker: uploadIDMarker,
-		Uploads:        resultUpds,
+		Bucket:             bucket,
+		Delimiter:          delimiter,
+		KeyMarker:          keyMarker,
+		MaxUploads:         maxUploads,
+		Prefix:             prefix,
+		NextKeyMarker:      result.NextKeyMarker,
+		NextUploadIDMarker: result.NextUploadIDMarker,
+		UploadIDMarker:     uploadIDMarker,
+		IsTruncated:        result.IsTruncated,
+		Uploads:            result.Uploads,
+		CommonPrefixes:     result.CommonPrefixes,
 	}, nil
 }
 
 func (p *Posix) ListParts(ctx context.Context, input *s3.ListPartsInput) (s3response.ListPartsResult, error) {
+	release, err := p.acquireActionSlot(ctx)
+	if err != nil {
+		return s3response.ListPartsResult{}, err
+	}
+	defer release()
+
 	var lpr s3response.ListPartsResult
 
 	if input.Key == nil {
@@ -2190,6 +2538,10 @@ func (p *Posix) ListParts(ctx context.Context, input *s3.ListPartsInput) (s3resp
 	bucket := *input.Bucket
 	object := *input.Key
 	uploadID := *input.UploadId
+
+	if !p.isBucketValid(bucket) {
+		return lpr, s3err.GetAPIError(s3err.ErrInvalidBucketName)
+	}
 	stringMarker := ""
 	if input.PartNumberMarker != nil {
 		stringMarker = *input.PartNumberMarker
@@ -2202,11 +2554,11 @@ func (p *Posix) ListParts(ctx context.Context, input *s3.ListPartsInput) (s3resp
 		var err error
 		partNumberMarker, err = strconv.Atoi(stringMarker)
 		if err != nil {
-			return lpr, s3err.GetAPIError(s3err.ErrInvalidPartNumberMarker)
+			return lpr, s3err.GetInvalidMaxLimiterErr("part-number-marker")
 		}
 	}
 
-	_, err := os.Stat(bucket)
+	_, err = os.Stat(bucket)
 	if errors.Is(err, fs.ErrNotExist) {
 		return lpr, s3err.GetAPIError(s3err.ErrNoSuchBucket)
 	}
@@ -2303,10 +2655,6 @@ func (p *Posix) ListParts(ctx context.Context, input *s3.ListPartsInput) (s3resp
 		nextpart = parts[len(parts)-1].PartNumber
 	}
 
-	userMetaData := make(map[string]string)
-	upiddir := filepath.Join(objdir, uploadID)
-	p.loadObjectMetaData(nil, bucket, upiddir, nil, userMetaData)
-
 	return s3response.ListPartsResult{
 		Bucket:               bucket,
 		IsTruncated:          oldLen != newLen,
@@ -2328,6 +2676,16 @@ type hashConfig struct {
 }
 
 func (p *Posix) UploadPart(ctx context.Context, input *s3.UploadPartInput) (*s3.UploadPartOutput, error) {
+	release, err := p.acquireActionSlot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
+	return p.UploadPartWithPostFunc(ctx, input, func(*os.File) error { return nil })
+}
+
+func (p *Posix) UploadPartWithPostFunc(ctx context.Context, input *s3.UploadPartInput, postprocess func(f *os.File) error) (*s3.UploadPartOutput, error) {
 	acct, ok := ctx.Value("account").(auth.Account)
 	if !ok {
 		acct = auth.Account{}
@@ -2340,6 +2698,10 @@ func (p *Posix) UploadPart(ctx context.Context, input *s3.UploadPartInput) (*s3.
 	bucket := *input.Bucket
 	object := *input.Key
 	uploadID := *input.UploadId
+
+	if !p.isBucketValid(bucket) {
+		return nil, s3err.GetAPIError(s3err.ErrInvalidBucketName)
+	}
 	part := input.PartNumber
 	length := int64(0)
 	if input.ContentLength != nil {
@@ -2382,68 +2744,104 @@ func (p *Posix) UploadPart(ctx context.Context, input *s3.UploadPartInput) (*s3.
 	hash := md5.New()
 	tr := io.TeeReader(r, hash)
 
-	hashConfigs := []hashConfig{
-		{input.ChecksumCRC32, utils.HashTypeCRC32},
-		{input.ChecksumCRC32C, utils.HashTypeCRC32C},
-		{input.ChecksumSHA1, utils.HashTypeSha1},
-		{input.ChecksumSHA256, utils.HashTypeSha256},
-		{input.ChecksumCRC64NVME, utils.HashTypeCRC64NVME},
+	chRdr, chunkUpload := input.Body.(middlewares.ChecksumReader)
+	isTrailingChecksum := chunkUpload && chRdr.Algorithm() != ""
+
+	// user input checksum algorithm: either with chunk uploads or with request headers
+	var inputChAlgo utils.HashType
+	// user input checksum value specified with request headers
+	var inputSum string
+
+	if !isTrailingChecksum {
+		hashConfigs := []hashConfig{
+			{input.ChecksumCRC32, utils.HashTypeCRC32},
+			{input.ChecksumCRC32C, utils.HashTypeCRC32C},
+			{input.ChecksumSHA1, utils.HashTypeSha1},
+			{input.ChecksumSHA256, utils.HashTypeSha256},
+			{input.ChecksumCRC64NVME, utils.HashTypeCRC64NVME},
+		}
+
+		for _, config := range hashConfigs {
+			if config.value != nil {
+				inputChAlgo = config.hashType
+				inputSum = *config.value
+				break
+			}
+		}
+	} else {
+		inputChAlgo = utils.HashType(chRdr.Algorithm())
 	}
 
+	exposeChecksum := inputChAlgo != ""
+
+	checksums, err := p.retrieveChecksums(nil, bucket, mpPath)
+	if err != nil && !errors.Is(err, meta.ErrNoSuchKey) {
+		return nil, fmt.Errorf("retrieve mp checksum: %w", err)
+	}
+
+	// If checksum isn't provided for the part,
+	// but it has been provided on mp initialization
+	// and checksum type is 'COMPOSITE', return mismatch error
+	if inputChAlgo == "" && checksums.Type == types.ChecksumTypeComposite {
+		return nil, s3err.GetChecksumTypeMismatchErr(checksums.Algorithm, "null")
+	}
+
+	// Check if the provided checksum algorithm match
+	// the one specified on mp initialization
+	if inputChAlgo != "" && checksums.Type != "" {
+		algo := types.ChecksumAlgorithm(strings.ToUpper(string(inputChAlgo)))
+		if checksums.Algorithm != algo {
+			return nil, s3err.GetChecksumTypeMismatchErr(checksums.Algorithm, algo)
+		}
+	}
+
+	if inputChAlgo == "" {
+		// default to crc64nvme
+		inputChAlgo = utils.HashTypeCRC64NVME
+	}
+
+	// hashreader is responsible to calculate and validate
+	// user input checksums
 	var hashRdr *utils.HashReader
-	for _, config := range hashConfigs {
-		if config.value != nil {
-			hashRdr, err = utils.NewHashReader(tr, *config.value, config.hashType)
+	// crc64nvmeRdr is used to calculate the object crc64nvme
+	// only for internal usage
+	var crc64nvmeRdr *utils.HashReader
+
+	if checksums.Type == "" {
+		if inputChAlgo != utils.HashTypeCRC64NVME {
+			// if the input checksum algorithm isn't crc64nvme, create a
+			// crc64nvme reader no matter if checksum is
+			// received from chunk reader or request headers.
+			crc64nvmeRdr, err = utils.NewHashReader(tr, "", utils.HashTypeCRC64NVME)
+			if err != nil {
+				return nil, fmt.Errorf("initialize crc64nvme hash reader: %w", err)
+			}
+			tr = crc64nvmeRdr
+		}
+
+		if !isTrailingChecksum {
+			// create a new hash reader for the user input checksum for calculation
+			// if the checksum doesn't come from chunk readers
+			hashRdr, err = utils.NewHashReader(tr, inputSum, inputChAlgo)
 			if err != nil {
 				return nil, fmt.Errorf("initialize hash reader: %w", err)
 			}
 
 			tr = hashRdr
 		}
-	}
+	} else {
+		// if no checksum algorithm or precalculated checksum is
+		// provided, but one has been on multipart upload initialization,
+		// anyways calculate and store the uploaded part checksum
+		if !isTrailingChecksum {
+			chAlgo := utils.HashType(strings.ToLower(string(checksums.Algorithm)))
+			hashRdr, err = utils.NewHashReader(tr, inputSum, chAlgo)
+			if err != nil {
+				return nil, fmt.Errorf("initialize hash reader: %w", err)
+			}
 
-	// If only the checksum algorithm is provided register
-	// a new HashReader to calculate the object checksum
-	if hashRdr == nil && input.ChecksumAlgorithm != "" {
-		hashRdr, err = utils.NewHashReader(tr, "", utils.HashType(strings.ToLower(string(input.ChecksumAlgorithm))))
-		if err != nil {
-			return nil, fmt.Errorf("initialize hash reader: %w", err)
+			tr = hashRdr
 		}
-
-		tr = hashRdr
-	}
-
-	checksums, chErr := p.retrieveChecksums(nil, bucket, mpPath)
-	if chErr != nil && !errors.Is(chErr, meta.ErrNoSuchKey) {
-		return nil, fmt.Errorf("retreive mp checksum: %w", chErr)
-	}
-
-	// If checksum isn't provided for the part,
-	// but it has been provided on mp initalization
-	// and checksum type is 'COMPOSITE', return mismatch error
-	if hashRdr == nil && chErr == nil && checksums.Type == types.ChecksumTypeComposite {
-		return nil, s3err.GetChecksumTypeMismatchErr(checksums.Algorithm, "null")
-	}
-
-	// Check if the provided checksum algorithm match
-	// the one specified on mp initialization
-	if hashRdr != nil && chErr == nil && checksums.Type != "" {
-		algo := types.ChecksumAlgorithm(strings.ToUpper(string(hashRdr.Type())))
-		if checksums.Algorithm != algo {
-			return nil, s3err.GetChecksumTypeMismatchErr(checksums.Algorithm, algo)
-		}
-	}
-
-	// if no checksum algorithm or precalculated checksum is
-	// provided, but one has been on multipart upload initialization,
-	// anyways calculate and store the uploaded part checksum
-	if hashRdr == nil && checksums.Algorithm != "" {
-		hashRdr, err = utils.NewHashReader(tr, "", utils.HashType(strings.ToLower(string(checksums.Algorithm))))
-		if err != nil {
-			return nil, fmt.Errorf("initialize hash reader: %w", err)
-		}
-
-		tr = hashRdr
 	}
 
 	_, err = io.Copy(f, tr)
@@ -2468,39 +2866,90 @@ func (p *Posix) UploadPart(ctx context.Context, input *s3.UploadPartInput) (*s3.
 		ETag: &etag,
 	}
 
-	if hashRdr != nil {
+	// if a checksum algorithm has been provided on mp initiation
+	// the checksums should be stored, otherwise only returned
+	// in the response without storing
+	storeChecksum := checksums.Type != ""
+
+	if storeChecksum {
 		checksum := s3response.Checksum{
-			Algorithm: input.ChecksumAlgorithm,
+			Algorithm: checksums.Algorithm,
 		}
 
-		// Validate the provided checksum
-		sum := hashRdr.Sum()
-		switch hashRdr.Type() {
-		case utils.HashTypeCRC32:
+		var sum string
+		if isTrailingChecksum {
+			sum = chRdr.Checksum()
+		}
+		if hashRdr != nil {
+			sum = hashRdr.Sum()
+		}
+
+		// Assign the checksum
+		switch checksums.Algorithm {
+		case types.ChecksumAlgorithmCrc32:
 			checksum.CRC32 = &sum
 			res.ChecksumCRC32 = &sum
-		case utils.HashTypeCRC32C:
+		case types.ChecksumAlgorithmCrc32c:
 			checksum.CRC32C = &sum
 			res.ChecksumCRC32C = &sum
-		case utils.HashTypeSha1:
+		case types.ChecksumAlgorithmSha1:
 			checksum.SHA1 = &sum
 			res.ChecksumSHA1 = &sum
-		case utils.HashTypeSha256:
+		case types.ChecksumAlgorithmSha256:
 			checksum.SHA256 = &sum
 			res.ChecksumSHA256 = &sum
-		case utils.HashTypeCRC64NVME:
+		case types.ChecksumAlgorithmCrc64nvme:
 			checksum.CRC64NVME = &sum
 			res.ChecksumCRC64NVME = &sum
 		}
 
-		// Store the checksums if the checksum type has been
-		// specified on mp initialization
-		if checksums.Type != "" {
-			err := p.storeChecksums(f.File(), bucket, partPath, checksum)
-			if err != nil {
-				return nil, fmt.Errorf("store checksum: %w", err)
+		err := p.storeChecksums(f.File(), bucket, partPath, checksum)
+		if err != nil {
+			return nil, fmt.Errorf("store checksum: %w", err)
+		}
+	} else {
+		var internalCrc64NvmeSum string
+		if inputChAlgo == utils.HashTypeCRC64NVME {
+			if isTrailingChecksum {
+				internalCrc64NvmeSum = chRdr.Checksum()
+			} else {
+				internalCrc64NvmeSum = hashRdr.Sum()
+			}
+		} else {
+			internalCrc64NvmeSum = crc64nvmeRdr.Sum()
+		}
+
+		err := p.meta.StoreAttribute(f.File(), bucket, partPath, partCrc64nvme, []byte(internalCrc64NvmeSum))
+		if err != nil {
+			return nil, fmt.Errorf("store part internal crc64nvme: %w", err)
+		}
+
+		if exposeChecksum {
+			var sumToReturn string
+			if isTrailingChecksum {
+				sumToReturn = chRdr.Checksum()
+			} else {
+				sumToReturn = hashRdr.Sum()
+			}
+
+			switch inputChAlgo {
+			case utils.HashTypeCRC32:
+				res.ChecksumCRC32 = &sumToReturn
+			case utils.HashTypeCRC32C:
+				res.ChecksumCRC32C = &sumToReturn
+			case utils.HashTypeSha1:
+				res.ChecksumSHA1 = &sumToReturn
+			case utils.HashTypeSha256:
+				res.ChecksumSHA256 = &sumToReturn
+			case utils.HashTypeCRC64NVME:
+				res.ChecksumCRC64NVME = &sumToReturn
 			}
 		}
+	}
+
+	err = postprocess(f.File())
+	if err != nil {
+		return nil, fmt.Errorf("upload part post process failed: %w", err)
 	}
 
 	err = f.link()
@@ -2512,6 +2961,12 @@ func (p *Posix) UploadPart(ctx context.Context, input *s3.UploadPartInput) (*s3.
 }
 
 func (p *Posix) UploadPartCopy(ctx context.Context, upi *s3.UploadPartCopyInput) (s3response.CopyPartResult, error) {
+	release, err := p.acquireActionSlot(ctx)
+	if err != nil {
+		return s3response.CopyPartResult{}, err
+	}
+	defer release()
+
 	acct, ok := ctx.Value("account").(auth.Account)
 	if !ok {
 		acct = auth.Account{}
@@ -2521,7 +2976,11 @@ func (p *Posix) UploadPartCopy(ctx context.Context, upi *s3.UploadPartCopyInput)
 		return s3response.CopyPartResult{}, s3err.GetAPIError(s3err.ErrNoSuchKey)
 	}
 
-	_, err := os.Stat(*upi.Bucket)
+	if !p.isBucketValid(*upi.Bucket) {
+		return s3response.CopyPartResult{}, s3err.GetAPIError(s3err.ErrInvalidBucketName)
+	}
+
+	_, err = os.Stat(*upi.Bucket)
 	if errors.Is(err, fs.ErrNotExist) {
 		return s3response.CopyPartResult{}, s3err.GetAPIError(s3err.ErrNoSuchBucket)
 	}
@@ -2644,16 +3103,17 @@ func (p *Posix) UploadPartCopy(ctx context.Context, upi *s3.UploadPartCopyInput)
 
 	mpChecksums, err := p.retrieveChecksums(nil, *upi.Bucket, filepath.Join(objdir, *upi.UploadId))
 	if err != nil && !errors.Is(err, meta.ErrNoSuchKey) {
-		return s3response.CopyPartResult{}, fmt.Errorf("retreive mp checksums: %w", err)
+		return s3response.CopyPartResult{}, fmt.Errorf("retrieve mp checksums: %w", err)
 	}
 
 	checksums, err := p.retrieveChecksums(nil, objPath, "")
 	if err != nil && !errors.Is(err, meta.ErrNoSuchKey) {
-		return s3response.CopyPartResult{}, fmt.Errorf("retreive object part checksums: %w", err)
+		return s3response.CopyPartResult{}, fmt.Errorf("retrieve object part checksums: %w", err)
 	}
 
 	// TODO: Should the checksum be recalculated or just copied ?
 	var hashRdr *utils.HashReader
+	var crc64nvmeRdr *utils.HashReader
 	if mpChecksums.Algorithm != "" {
 		if checksums.Algorithm == "" || mpChecksums.Algorithm != checksums.Algorithm {
 			hashRdr, err = utils.NewHashReader(tr, "", utils.HashType(strings.ToLower(string(mpChecksums.Algorithm))))
@@ -2663,6 +3123,14 @@ func (p *Posix) UploadPartCopy(ctx context.Context, upi *s3.UploadPartCopyInput)
 
 			tr = hashRdr
 		}
+	} else {
+		// if no checksum has been specified on multipart upload initiation
+		// create an internal crc64nvme reader to calculate and stored the internal crc64nvme
+		crc64nvmeRdr, err = utils.NewHashReader(tr, "", utils.HashTypeCRC64NVME)
+		if err != nil {
+			return s3response.CopyPartResult{}, fmt.Errorf("initialize internal crc64nvme reader: %w", err)
+		}
+		tr = crc64nvmeRdr
 	}
 
 	_, err = io.Copy(f, tr)
@@ -2678,13 +3146,14 @@ func (p *Posix) UploadPartCopy(ctx context.Context, upi *s3.UploadPartCopyInput)
 			checksums = s3response.Checksum{}
 		} else {
 			if hashRdr == nil {
-				err := p.storeChecksums(f.File(), objPath, "", checksums)
+				err := p.storeChecksums(f.File(), *upi.Bucket, partPath, checksums)
 				if err != nil {
 					return s3response.CopyPartResult{}, fmt.Errorf("store part checksum: %w", err)
 				}
 			}
 		}
 	}
+
 	if hashRdr != nil {
 		algo := types.ChecksumAlgorithm(strings.ToUpper(string(hashRdr.Type())))
 		checksums = s3response.Checksum{
@@ -2705,9 +3174,18 @@ func (p *Posix) UploadPartCopy(ctx context.Context, upi *s3.UploadPartCopyInput)
 			checksums.CRC64NVME = &sum
 		}
 
-		err := p.storeChecksums(f.File(), objPath, "", checksums)
+		err := p.storeChecksums(f.File(), *upi.Bucket, partPath, checksums)
 		if err != nil {
 			return s3response.CopyPartResult{}, fmt.Errorf("store part checksum: %w", err)
+		}
+	}
+
+	if crc64nvmeRdr != nil {
+		// store the internal crc64nvme
+		internalCrc64NvmeSum := crc64nvmeRdr.Sum()
+		err := p.meta.StoreAttribute(f.File(), *upi.Bucket, partPath, partCrc64nvme, []byte(internalCrc64NvmeSum))
+		if err != nil {
+			return s3response.CopyPartResult{}, fmt.Errorf("store part internal crc64nvme: %w", err)
 		}
 	}
 
@@ -2739,7 +3217,35 @@ func (p *Posix) UploadPartCopy(ctx context.Context, upi *s3.UploadPartCopyInput)
 	}, nil
 }
 
+// getEmptyChecksumValue returns the base64-encoded checksum
+// for an empty payload for the given algorithm defaulting to crc64nvme
+func getEmptyChecksumValue(algo types.ChecksumAlgorithm) string {
+	switch algo {
+	case types.ChecksumAlgorithmCrc32:
+		return "AAAAAA=="
+	case types.ChecksumAlgorithmCrc32c:
+		return "AAAAAA=="
+	case types.ChecksumAlgorithmSha1:
+		return "2jmj7l5rSw0yVb/vlWAYkK/YBwk="
+	case types.ChecksumAlgorithmSha256:
+		return "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU="
+	default:
+		// default to crc64nvme
+		return "AAAAAAAAAAA="
+	}
+}
+
 func (p *Posix) PutObject(ctx context.Context, po s3response.PutObjectInput) (s3response.PutObjectOutput, error) {
+	release, err := p.acquireActionSlot(ctx)
+	if err != nil {
+		return s3response.PutObjectOutput{}, err
+	}
+	defer release()
+
+	return p.PutObjectWithPostFunc(ctx, po, func(*os.File) error { return nil })
+}
+
+func (p *Posix) PutObjectWithPostFunc(ctx context.Context, po s3response.PutObjectInput, postprocess func(f *os.File) error) (s3response.PutObjectOutput, error) {
 	acct, ok := ctx.Value("account").(auth.Account)
 	if !ok {
 		acct = auth.Account{}
@@ -2748,9 +3254,8 @@ func (p *Posix) PutObject(ctx context.Context, po s3response.PutObjectInput) (s3
 	if po.Key == nil {
 		return s3response.PutObjectOutput{}, s3err.GetAPIError(s3err.ErrNoSuchKey)
 	}
-	// Override the checksum algorithm with default: CRC64NVME
-	if po.ChecksumAlgorithm == "" {
-		po.ChecksumAlgorithm = types.ChecksumAlgorithmCrc64nvme
+	if !p.isBucketValid(*po.Bucket) {
+		return s3response.PutObjectOutput{}, s3err.GetAPIError(s3err.ErrInvalidBucketName)
 	}
 	_, err := os.Stat(*po.Bucket)
 	if errors.Is(err, fs.ErrNotExist) {
@@ -2769,8 +3274,8 @@ func (p *Posix) PutObject(ctx context.Context, po s3response.PutObjectInput) (s3
 
 	// evaluate preconditions
 	etagBytes, err := p.meta.RetrieveAttribute(nil, *po.Bucket, *po.Key, etagkey)
-	if err == nil {
-		err := backend.EvaluateMatchPreconditions(string(etagBytes), po.IfMatch, po.IfNoneMatch)
+	if err == nil || errors.Is(err, fs.ErrNotExist) || errors.Is(err, meta.ErrNoSuchKey) {
+		err = backend.EvaluateObjectPutPreconditions(string(etagBytes), po.IfMatch, po.IfNoneMatch, err == nil)
 		if err != nil {
 			return s3response.PutObjectOutput{}, err
 		}
@@ -2782,6 +3287,39 @@ func (p *Posix) PutObject(ctx context.Context, po s3response.PutObjectInput) (s3
 	if po.ContentLength != nil {
 		contentLength = *po.ContentLength
 	}
+
+	chRdr, chunkUpload := po.Body.(middlewares.ChecksumReader)
+	isTrailingChecksum := chunkUpload && chRdr.Algorithm() != ""
+
+	checksumAlgorithm := po.ChecksumAlgorithm
+	checksumValue := ""
+
+	if isTrailingChecksum {
+		checksumAlgorithm = types.ChecksumAlgorithm(strings.ToUpper(chRdr.Algorithm()))
+		checksumValue = chRdr.Checksum()
+	} else {
+		hashConfigs := []hashConfig{
+			{po.ChecksumCRC32, utils.HashTypeCRC32},
+			{po.ChecksumCRC32C, utils.HashTypeCRC32C},
+			{po.ChecksumSHA1, utils.HashTypeSha1},
+			{po.ChecksumSHA256, utils.HashTypeSha256},
+			{po.ChecksumCRC64NVME, utils.HashTypeCRC64NVME},
+		}
+
+		for _, config := range hashConfigs {
+			if config.value != nil {
+				checksumAlgorithm = types.ChecksumAlgorithm(strings.ToUpper(string(config.hashType)))
+				checksumValue = *config.value
+				break
+			}
+		}
+
+		if checksumAlgorithm == "" {
+			// default to crc64nvme
+			checksumAlgorithm = types.ChecksumAlgorithmCrc64nvme
+		}
+	}
+
 	if strings.HasSuffix(*po.Key, "/") {
 		// object is directory
 		if contentLength != 0 {
@@ -2799,11 +3337,16 @@ func (p *Posix) PutObject(ctx context.Context, po s3response.PutObjectInput) (s3
 			return s3response.PutObjectOutput{}, err
 		}
 
-		for k, v := range po.Metadata {
-			err := p.meta.StoreAttribute(nil, *po.Bucket, *po.Key,
-				fmt.Sprintf("%v.%v", metaHdr, k), []byte(v))
+		err = p.storeObjectMetadata(nil, *po.Bucket, *po.Key, po.Metadata)
+		if err != nil {
+			return s3response.PutObjectOutput{}, fmt.Errorf("set object metadata: %w", err)
+		}
+
+		// Set object tagging
+		if tags != nil {
+			err := p.PutObjectTagging(withCtxNoSlot(ctx), *po.Bucket, *po.Key, "", tags)
 			if err != nil {
-				return s3response.PutObjectOutput{}, fmt.Errorf("set user attr %q: %w", k, err)
+				return s3response.PutObjectOutput{}, err
 			}
 		}
 
@@ -2821,10 +3364,46 @@ func (p *Posix) PutObject(ctx context.Context, po s3response.PutObjectInput) (s3
 			return s3response.PutObjectOutput{}, fmt.Errorf("set content-type attr: %w", err)
 		}
 
+		expectedSum := getEmptyChecksumValue(checksumAlgorithm)
+		if checksumValue != "" && expectedSum != checksumValue {
+			return s3response.PutObjectOutput{}, s3err.GetChecksumBadDigestErr(checksumAlgorithm)
+		}
+
+		// set empty checksum
+		checksum := s3response.Checksum{
+			Type:      types.ChecksumTypeFullObject,
+			Algorithm: checksumAlgorithm,
+		}
+
+		// Store the calculated checksum in the object metadata
+		switch checksumAlgorithm {
+		case types.ChecksumAlgorithmCrc32:
+			checksum.CRC32 = &expectedSum
+		case types.ChecksumAlgorithmCrc32c:
+			checksum.CRC32C = &expectedSum
+		case types.ChecksumAlgorithmSha1:
+			checksum.SHA1 = &expectedSum
+		case types.ChecksumAlgorithmSha256:
+			checksum.SHA256 = &expectedSum
+		case types.ChecksumAlgorithmCrc64nvme:
+			checksum.CRC64NVME = &expectedSum
+		}
+
+		err = p.storeChecksums(nil, *po.Bucket, *po.Key, checksum)
+		if err != nil {
+			return s3response.PutObjectOutput{}, fmt.Errorf("store checksum: %w", err)
+		}
+
 		// for directory object no version is created
 		return s3response.PutObjectOutput{
-			ETag: emptyMD5,
-			Size: &contentLength,
+			ETag:              emptyMD5,
+			Size:              &contentLength,
+			ChecksumType:      checksum.Type,
+			ChecksumCRC32:     checksum.CRC32,
+			ChecksumCRC32C:    checksum.CRC32C,
+			ChecksumCRC64NVME: checksum.CRC64NVME,
+			ChecksumSHA1:      checksum.SHA1,
+			ChecksumSHA256:    checksum.SHA256,
 		}, nil
 	}
 
@@ -2840,7 +3419,7 @@ func (p *Posix) PutObject(ctx context.Context, po s3response.PutObjectInput) (s3
 		return s3response.PutObjectOutput{}, s3err.GetAPIError(s3err.ErrExistingObjectIsDirectory)
 	}
 
-	// if the versioninng is enabled first create the file object version
+	// if the versioning is enabled first create the file object version
 	if p.versioningEnabled() && vStatus != "" && err == nil {
 		var isVersionIdMissing bool
 		if p.isBucketVersioningSuspended(vStatus) {
@@ -2851,7 +3430,7 @@ func (p *Posix) PutObject(ctx context.Context, po s3response.PutObjectInput) (s3
 			isVersionIdMissing = len(vIdBytes) == 0
 		}
 		if !isVersionIdMissing {
-			_, err := p.createObjVersion(*po.Bucket, *po.Key, d.Size(), acct)
+			_, err := p.createObjVersion(*po.Bucket, *po.Key, d.Size(), acct, false)
 			if err != nil {
 				return s3response.PutObjectOutput{}, fmt.Errorf("create object version: %w", err)
 			}
@@ -2861,7 +3440,10 @@ func (p *Posix) PutObject(ctx context.Context, po s3response.PutObjectInput) (s3
 		return s3response.PutObjectOutput{}, s3err.GetAPIError(s3err.ErrKeyTooLong)
 	}
 	if errors.Is(err, syscall.ENOTDIR) {
-		return s3response.PutObjectOutput{}, s3err.GetAPIError(s3err.ErrObjectParentIsFile)
+		parentErr := handleParentDirError(name)
+		if parentErr != nil {
+			return s3response.PutObjectOutput{}, parentErr
+		}
 	}
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return s3response.PutObjectOutput{}, fmt.Errorf("stat object: %w", err)
@@ -2882,30 +3464,9 @@ func (p *Posix) PutObject(ctx context.Context, po s3response.PutObjectInput) (s3
 	hash := md5.New()
 	rdr := io.TeeReader(po.Body, hash)
 
-	hashConfigs := []hashConfig{
-		{po.ChecksumCRC32, utils.HashTypeCRC32},
-		{po.ChecksumCRC32C, utils.HashTypeCRC32C},
-		{po.ChecksumSHA1, utils.HashTypeSha1},
-		{po.ChecksumSHA256, utils.HashTypeSha256},
-		{po.ChecksumCRC64NVME, utils.HashTypeCRC64NVME},
-	}
 	var hashRdr *utils.HashReader
-
-	for _, config := range hashConfigs {
-		if config.value != nil {
-			hashRdr, err = utils.NewHashReader(rdr, *config.value, config.hashType)
-			if err != nil {
-				return s3response.PutObjectOutput{}, fmt.Errorf("initialize hash reader: %w", err)
-			}
-
-			rdr = hashRdr
-		}
-	}
-
-	// If only the checksum algorithm is provided register
-	// a new HashReader to calculate the object checksum
-	if hashRdr == nil && po.ChecksumAlgorithm != "" {
-		hashRdr, err = utils.NewHashReader(rdr, "", utils.HashType(strings.ToLower(string(po.ChecksumAlgorithm))))
+	if !isTrailingChecksum {
+		hashRdr, err = utils.NewHashReader(rdr, checksumValue, utils.HashType(strings.ToLower(string(checksumAlgorithm))))
 		if err != nil {
 			return s3response.PutObjectOutput{}, fmt.Errorf("initialize hash reader: %w", err)
 		}
@@ -2941,7 +3502,7 @@ func (p *Posix) PutObject(ctx context.Context, po s3response.PutObjectInput) (s3
 		versionID = ulid.Make().String()
 	}
 
-	// Before finaliazing the object creation remove
+	// Before finalizing the object creation remove
 	// null versionId object from versioning directory
 	// if it exists and the versioning status is Suspended
 	if p.isBucketVersioningSuspended(vStatus) {
@@ -2952,44 +3513,35 @@ func (p *Posix) PutObject(ctx context.Context, po s3response.PutObjectInput) (s3
 		versionID = nullVersionId
 	}
 
-	for k, v := range po.Metadata {
-		err := p.meta.StoreAttribute(f.File(), *po.Bucket, *po.Key,
-			fmt.Sprintf("%v.%v", metaHdr, k), []byte(v))
-		if err != nil {
-			return s3response.PutObjectOutput{}, fmt.Errorf("set user attr %q: %w", k, err)
-		}
+	var sum string
+
+	if isTrailingChecksum {
+		sum = chRdr.Checksum()
+	} else {
+		sum = hashRdr.Sum()
 	}
 
-	checksum := s3response.Checksum{}
+	checksum := s3response.Checksum{
+		Type:      types.ChecksumTypeFullObject,
+		Algorithm: checksumAlgorithm,
+	}
 
 	// Store the calculated checksum in the object metadata
-	if hashRdr != nil {
-		// The checksum type is always FULL_OBJECT for PutObject
-		checksum.Type = types.ChecksumTypeFullObject
-
-		sum := hashRdr.Sum()
-		switch hashRdr.Type() {
-		case utils.HashTypeCRC32:
-			checksum.CRC32 = &sum
-			checksum.Algorithm = types.ChecksumAlgorithmCrc32
-		case utils.HashTypeCRC32C:
-			checksum.CRC32C = &sum
-			checksum.Algorithm = types.ChecksumAlgorithmCrc32c
-		case utils.HashTypeSha1:
-			checksum.SHA1 = &sum
-			checksum.Algorithm = types.ChecksumAlgorithmSha1
-		case utils.HashTypeSha256:
-			checksum.SHA256 = &sum
-			checksum.Algorithm = types.ChecksumAlgorithmSha256
-		case utils.HashTypeCRC64NVME:
-			checksum.CRC64NVME = &sum
-			checksum.Algorithm = types.ChecksumAlgorithmCrc64nvme
-		}
-
-		err := p.storeChecksums(f.File(), *po.Bucket, *po.Key, checksum)
-		if err != nil {
-			return s3response.PutObjectOutput{}, fmt.Errorf("store checksum: %w", err)
-		}
+	switch checksumAlgorithm {
+	case types.ChecksumAlgorithmCrc32:
+		checksum.CRC32 = &sum
+	case types.ChecksumAlgorithmCrc32c:
+		checksum.CRC32C = &sum
+	case types.ChecksumAlgorithmSha1:
+		checksum.SHA1 = &sum
+	case types.ChecksumAlgorithmSha256:
+		checksum.SHA256 = &sum
+	case types.ChecksumAlgorithmCrc64nvme:
+		checksum.CRC64NVME = &sum
+	}
+	err = p.storeChecksums(f.File(), *po.Bucket, *po.Key, checksum)
+	if err != nil {
+		return s3response.PutObjectOutput{}, fmt.Errorf("store checksum: %w", err)
 	}
 
 	err = p.meta.StoreAttribute(f.File(), *po.Bucket, *po.Key, etagkey, []byte(etag))
@@ -2997,14 +3549,16 @@ func (p *Posix) PutObject(ctx context.Context, po s3response.PutObjectInput) (s3
 		return s3response.PutObjectOutput{}, fmt.Errorf("set etag attr: %w", err)
 	}
 
-	err = p.storeObjectMetadata(f.File(), *po.Bucket, *po.Key, objectMetadata{
-		ContentType:        po.ContentType,
-		ContentEncoding:    po.ContentEncoding,
-		ContentLanguage:    po.ContentLanguage,
-		ContentDisposition: po.ContentDisposition,
-		CacheControl:       po.CacheControl,
-		Expires:            po.Expires,
-	})
+	err = p.storeObjectMetaProperties(f.File(), *po.Bucket, *po.Key,
+		metaProperties{
+			ContentType:        po.ContentType,
+			ContentEncoding:    po.ContentEncoding,
+			ContentLanguage:    po.ContentLanguage,
+			ContentDisposition: po.ContentDisposition,
+			CacheControl:       po.CacheControl,
+			Expires:            po.Expires,
+			Metadata:           po.Metadata,
+		})
 	if err != nil {
 		return s3response.PutObjectOutput{}, err
 	}
@@ -3015,6 +3569,13 @@ func (p *Posix) PutObject(ctx context.Context, po s3response.PutObjectInput) (s3
 			return s3response.PutObjectOutput{}, fmt.Errorf("set versionId attr: %w", err)
 		}
 	}
+
+	err = postprocess(f.File())
+	if err != nil {
+		return s3response.PutObjectOutput{},
+			fmt.Errorf("put object post process failed: %w", err)
+	}
+
 	err = f.link()
 	if errors.Is(err, syscall.EEXIST) {
 		return s3response.PutObjectOutput{
@@ -3028,7 +3589,7 @@ func (p *Posix) PutObject(ctx context.Context, po s3response.PutObjectInput) (s3
 
 	// Set object tagging
 	if tags != nil {
-		err := p.PutObjectTagging(ctx, *po.Bucket, *po.Key, tags)
+		err := p.PutObjectTagging(withCtxNoSlot(ctx), *po.Bucket, *po.Key, "", tags)
 		if errors.Is(err, fs.ErrNotExist) {
 			return s3response.PutObjectOutput{
 				ETag:      etag,
@@ -3042,8 +3603,11 @@ func (p *Posix) PutObject(ctx context.Context, po s3response.PutObjectInput) (s3
 
 	// Set object legal hold
 	if po.ObjectLockLegalHoldStatus == types.ObjectLockLegalHoldStatusOn {
-		err := p.PutObjectLegalHold(ctx, *po.Bucket, *po.Key, "", true)
+		err := p.PutObjectLegalHold(withCtxNoSlot(ctx), *po.Bucket, *po.Key, "", true)
 		if err != nil {
+			if errors.Is(err, s3err.GetAPIError(s3err.ErrMissingObjectLockConfiguration)) {
+				err = s3err.GetAPIError(s3err.ErrMissingObjectLockConfigurationNoSpaces)
+			}
 			return s3response.PutObjectOutput{}, err
 		}
 	}
@@ -3058,8 +3622,11 @@ func (p *Posix) PutObject(ctx context.Context, po s3response.PutObjectInput) (s3
 		if err != nil {
 			return s3response.PutObjectOutput{}, fmt.Errorf("parse object lock retention: %w", err)
 		}
-		err = p.PutObjectRetention(ctx, *po.Bucket, *po.Key, "", true, retParsed)
+		err = p.PutObjectRetention(withCtxNoSlot(ctx), *po.Bucket, *po.Key, "", retParsed)
 		if err != nil {
+			if errors.Is(err, s3err.GetAPIError(s3err.ErrMissingObjectLockConfiguration)) {
+				err = s3err.GetAPIError(s3err.ErrMissingObjectLockConfigurationNoSpaces)
+			}
 			return s3response.PutObjectOutput{}, err
 		}
 	}
@@ -3078,6 +3645,12 @@ func (p *Posix) PutObject(ctx context.Context, po s3response.PutObjectInput) (s3
 }
 
 func (p *Posix) DeleteObject(ctx context.Context, input *s3.DeleteObjectInput) (*s3.DeleteObjectOutput, error) {
+	release, err := p.acquireActionSlot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
 	if input.Key == nil {
 		return nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
 	}
@@ -3086,7 +3659,11 @@ func (p *Posix) DeleteObject(ctx context.Context, input *s3.DeleteObjectInput) (
 	object := *input.Key
 	isDir := strings.HasSuffix(object, "/")
 
-	_, err := os.Stat(bucket)
+	if !p.isBucketValid(bucket) {
+		return nil, s3err.GetAPIError(s3err.ErrInvalidBucketName)
+	}
+
+	_, err = os.Stat(bucket)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, s3err.GetAPIError(s3err.ErrNoSuchBucket)
 	}
@@ -3162,7 +3739,7 @@ func (p *Posix) DeleteObject(ctx context.Context, input *s3.DeleteObjectInput) (
 
 			// Creates a new object version in the versioning directory
 			if p.isBucketVersioningEnabled(vStatus) || string(vId) != nullVersionId {
-				_, err = p.createObjVersion(bucket, object, fi.Size(), acct)
+				_, err = p.createObjVersion(bucket, object, fi.Size(), acct, true)
 				if err != nil {
 					return nil, err
 				}
@@ -3197,7 +3774,13 @@ func (p *Posix) DeleteObject(ctx context.Context, input *s3.DeleteObjectInput) (
 			versionPath := p.genObjVersionPath(bucket, object)
 
 			vId, err := p.meta.RetrieveAttribute(nil, bucket, object, versionIdKey)
-			if err != nil && !errors.Is(err, meta.ErrNoSuchKey) && !errors.Is(err, fs.ErrNotExist) {
+			if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+				// AWS returns success if the object does not exist
+				return &s3.DeleteObjectOutput{
+					VersionId: input.VersionId,
+				}, nil
+			}
+			if err != nil && !errors.Is(err, meta.ErrNoSuchKey) {
 				return nil, fmt.Errorf("get obj versionId: %w", err)
 			}
 			if errors.Is(err, meta.ErrNoSuchKey) {
@@ -3432,11 +4015,19 @@ func (p *Posix) removeParents(bucket, object string) {
 }
 
 func (p *Posix) DeleteObjects(ctx context.Context, input *s3.DeleteObjectsInput) (s3response.DeleteResult, error) {
+	release, err := p.acquireActionSlot(ctx)
+	if err != nil {
+		return s3response.DeleteResult{}, err
+	}
+	defer release()
+
 	// delete object already checks bucket
 	delResult, errs := []types.DeletedObject{}, []types.Error{}
 	for _, obj := range input.Delete.Objects {
 		//TODO: Make the delete operation concurrent
-		res, err := p.DeleteObject(ctx, &s3.DeleteObjectInput{
+		// once concurrency is implemented, the posix rate limiter should
+		// be taken into account.
+		res, err := p.DeleteObject(withCtxNoSlot(ctx), &s3.DeleteObjectInput{
 			Bucket:    input.Bucket,
 			Key:       obj.Key,
 			VersionId: obj.VersionId,
@@ -3476,7 +4067,13 @@ func (p *Posix) DeleteObjects(ctx context.Context, input *s3.DeleteObjectsInput)
 	}, nil
 }
 
-func (p *Posix) GetObject(_ context.Context, input *s3.GetObjectInput) (*s3.GetObjectOutput, error) {
+func (p *Posix) GetObject(ctx context.Context, input *s3.GetObjectInput) (*s3.GetObjectOutput, error) {
+	release, err := p.acquireActionSlot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
 	if input.Key == nil {
 		return nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
 	}
@@ -3496,7 +4093,10 @@ func (p *Posix) GetObject(_ context.Context, input *s3.GetObjectInput) (*s3.GetO
 	}
 
 	bucket := *input.Bucket
-	_, err := os.Stat(bucket)
+	if !p.isBucketValid(bucket) {
+		return nil, s3err.GetAPIError(s3err.ErrInvalidBucketName)
+	}
+	_, err = os.Stat(bucket)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, s3err.GetAPIError(s3err.ErrNoSuchBucket)
 	}
@@ -3528,7 +4128,7 @@ func (p *Posix) GetObject(_ context.Context, input *s3.GetObjectInput) (*s3.GetO
 	fid, err := os.Stat(objPath)
 	if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
 		if versionId != "" {
-			return nil, s3err.GetAPIError(s3err.ErrInvalidVersionId)
+			return nil, s3err.GetAPIError(s3err.ErrNoSuchVersion)
 		}
 		return nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
 	}
@@ -3589,22 +4189,34 @@ func (p *Posix) GetObject(_ context.Context, input *s3.GetObjectInput) (*s3.GetO
 			return nil, err
 		}
 
-		userMetaData := make(map[string]string)
-
-		objMeta := p.loadObjectMetaData(nil, bucket, object, &fid, userMetaData)
+		objMeta := p.loadObjectMetaProperties(nil, bucket, object, &fid)
 
 		var tagCount *int32
-		tags, err := p.getAttrTags(bucket, object)
-		if err != nil && !errors.Is(err, s3err.GetAPIError(s3err.ErrBucketTaggingNotFound)) {
+		tags, err := p.getAttrTags(bucket, object, versionId)
+		if err != nil {
 			return nil, err
 		}
-		if tags != nil {
+		if len(tags) != 0 {
 			tgCount := int32(len(tags))
 			tagCount = &tgCount
 		}
 
+		var checksums s3response.Checksum
+		if input.ChecksumMode == types.ChecksumModeEnabled {
+			checksums, err = p.retrieveChecksums(nil, bucket, object)
+			if err != nil && !errors.Is(err, meta.ErrNoSuchKey) {
+				return nil, fmt.Errorf("get object checksums: %w", err)
+			}
+		}
+
 		var length int64 = 0
 		return &s3.GetObjectOutput{
+			ChecksumCRC32:      checksums.CRC32,
+			ChecksumCRC32C:     checksums.CRC32C,
+			ChecksumSHA1:       checksums.SHA1,
+			ChecksumSHA256:     checksums.SHA256,
+			ChecksumCRC64NVME:  checksums.CRC64NVME,
+			ChecksumType:       checksums.Type,
 			AcceptRanges:       backend.GetPtrFromString("bytes"),
 			ContentLength:      &length,
 			ContentEncoding:    objMeta.ContentEncoding,
@@ -3615,7 +4227,7 @@ func (p *Posix) GetObject(_ context.Context, input *s3.GetObjectInput) (*s3.GetO
 			ExpiresString:      objMeta.Expires,
 			ETag:               &etag,
 			LastModified:       backend.GetTimePtr(fid.ModTime()),
-			Metadata:           userMetaData,
+			Metadata:           objMeta.Metadata,
 			TagCount:           tagCount,
 			ContentRange:       nil,
 			StorageClass:       types.StorageClassStandard,
@@ -3669,30 +4281,24 @@ func (p *Posix) GetObject(_ context.Context, input *s3.GetObjectInput) (*s3.GetO
 			startOffset, startOffset+length-1, objSize)
 	}
 
-	userMetaData := make(map[string]string)
-
-	objMeta := p.loadObjectMetaData(f, bucket, object, &fi, userMetaData)
+	objMeta := p.loadObjectMetaProperties(f, bucket, object, &fi)
 
 	var tagCount *int32
-	tags, err := p.getAttrTags(bucket, object)
-	if err != nil && !errors.Is(err, s3err.GetAPIError(s3err.ErrBucketTaggingNotFound)) {
+	tags, err := p.getAttrTags(bucket, object, versionId)
+	if err != nil {
 		return nil, err
 	}
-	if tags != nil {
+	if len(tags) != 0 {
 		tgCount := int32(len(tags))
 		tagCount = &tgCount
 	}
 
 	var checksums s3response.Checksum
-	var cType types.ChecksumType
 	// Skip the checksums retreival if object isn't requested fully
 	if input.ChecksumMode == types.ChecksumModeEnabled && length-startOffset == objSize {
 		checksums, err = p.retrieveChecksums(f, bucket, object)
 		if err != nil && !errors.Is(err, meta.ErrNoSuchKey) {
 			return nil, fmt.Errorf("get object checksums: %w", err)
-		}
-		if checksums.Type != "" {
-			cType = checksums.Type
 		}
 	}
 
@@ -3714,7 +4320,7 @@ func (p *Posix) GetObject(_ context.Context, input *s3.GetObjectInput) (*s3.GetO
 		ExpiresString:      objMeta.Expires,
 		ETag:               &etag,
 		LastModified:       backend.GetTimePtr(fi.ModTime()),
-		Metadata:           userMetaData,
+		Metadata:           objMeta.Metadata,
 		TagCount:           tagCount,
 		ContentRange:       &contentRange,
 		StorageClass:       types.StorageClassStandard,
@@ -3725,11 +4331,17 @@ func (p *Posix) GetObject(_ context.Context, input *s3.GetObjectInput) (*s3.GetO
 		ChecksumSHA1:       checksums.SHA1,
 		ChecksumSHA256:     checksums.SHA256,
 		ChecksumCRC64NVME:  checksums.CRC64NVME,
-		ChecksumType:       cType,
+		ChecksumType:       checksums.Type,
 	}, nil
 }
 
 func (p *Posix) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s3.HeadObjectOutput, error) {
+	release, err := p.acquireActionSlot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
 	if input.Key == nil {
 		return nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
 	}
@@ -3748,7 +4360,11 @@ func (p *Posix) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s3.
 	bucket := *input.Bucket
 	object := *input.Key
 
-	_, err := os.Stat(bucket)
+	if !p.isBucketValid(bucket) {
+		return nil, s3err.GetAPIError(s3err.ErrInvalidBucketName)
+	}
+
+	_, err = os.Stat(bucket)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, s3err.GetAPIError(s3err.ErrNoSuchBucket)
 	}
@@ -3780,7 +4396,7 @@ func (p *Posix) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s3.
 	fi, err := os.Stat(objPath)
 	if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
 		if versionId != "" {
-			return nil, s3err.GetAPIError(s3err.ErrInvalidVersionId)
+			return nil, s3err.GetAPIError(s3err.ErrNoSuchVersion)
 		}
 		return nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
 	}
@@ -3825,8 +4441,7 @@ func (p *Posix) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s3.
 		versionId = string(vId)
 	}
 
-	userMetaData := make(map[string]string)
-	objMeta := p.loadObjectMetaData(nil, bucket, object, &fi, userMetaData)
+	objMeta := p.loadObjectMetaProperties(nil, bucket, object, &fi)
 
 	b, err := p.meta.RetrieveAttribute(nil, bucket, object, etagkey)
 	etag := string(b)
@@ -3862,7 +4477,7 @@ func (p *Posix) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s3.
 	}
 
 	var objectLockLegalHoldStatus types.ObjectLockLegalHoldStatus
-	status, err := p.GetObjectLegalHold(ctx, bucket, object, versionId)
+	status, err := p.GetObjectLegalHold(withCtxNoSlot(ctx), bucket, object, versionId)
 	if err == nil {
 		if *status {
 			objectLockLegalHoldStatus = types.ObjectLockLegalHoldStatusOn
@@ -3873,7 +4488,7 @@ func (p *Posix) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s3.
 
 	var objectLockMode types.ObjectLockMode
 	var objectLockRetainUntilDate *time.Time
-	retention, err := p.GetObjectRetention(ctx, bucket, object, versionId)
+	retention, err := p.GetObjectRetention(withCtxNoSlot(ctx), bucket, object, versionId)
 	if err == nil {
 		var config types.ObjectLockRetention
 		if err := json.Unmarshal(retention, &config); err == nil {
@@ -3883,15 +4498,21 @@ func (p *Posix) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s3.
 	}
 
 	var checksums s3response.Checksum
-	var cType types.ChecksumType
 	if input.ChecksumMode == types.ChecksumModeEnabled {
 		checksums, err = p.retrieveChecksums(nil, bucket, object)
 		if err != nil && !errors.Is(err, meta.ErrNoSuchKey) {
 			return nil, fmt.Errorf("get object checksums: %w", err)
 		}
-		if checksums.Type != "" {
-			cType = checksums.Type
-		}
+	}
+
+	var tagCount *int32
+	tags, err := p.getAttrTags(bucket, object, versionId)
+	if err != nil {
+		return nil, err
+	}
+	if len(tags) != 0 {
+		tc := int32(len(tags))
+		tagCount = &tc
 	}
 
 	return &s3.HeadObjectOutput{
@@ -3906,7 +4527,7 @@ func (p *Posix) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s3.
 		ExpiresString:             objMeta.Expires,
 		ETag:                      &etag,
 		LastModified:              backend.GetTimePtr(fi.ModTime()),
-		Metadata:                  userMetaData,
+		Metadata:                  objMeta.Metadata,
 		ObjectLockLegalHoldStatus: objectLockLegalHoldStatus,
 		ObjectLockMode:            objectLockMode,
 		ObjectLockRetainUntilDate: objectLockRetainUntilDate,
@@ -3917,12 +4538,19 @@ func (p *Posix) HeadObject(ctx context.Context, input *s3.HeadObjectInput) (*s3.
 		ChecksumSHA1:              checksums.SHA1,
 		ChecksumSHA256:            checksums.SHA256,
 		ChecksumCRC64NVME:         checksums.CRC64NVME,
-		ChecksumType:              cType,
+		ChecksumType:              checksums.Type,
+		TagCount:                  tagCount,
 	}, nil
 }
 
 func (p *Posix) GetObjectAttributes(ctx context.Context, input *s3.GetObjectAttributesInput) (s3response.GetObjectAttributesResponse, error) {
-	data, err := p.HeadObject(ctx, &s3.HeadObjectInput{
+	release, err := p.acquireActionSlot(ctx)
+	if err != nil {
+		return s3response.GetObjectAttributesResponse{}, err
+	}
+	defer release()
+
+	data, err := p.HeadObject(withCtxNoSlot(ctx), &s3.HeadObjectInput{
 		Bucket:       input.Bucket,
 		Key:          input.Key,
 		VersionId:    input.VersionId,
@@ -3958,6 +4586,12 @@ func (p *Posix) GetObjectAttributes(ctx context.Context, input *s3.GetObjectAttr
 }
 
 func (p *Posix) CopyObject(ctx context.Context, input s3response.CopyObjectInput) (s3response.CopyObjectOutput, error) {
+	release, err := p.acquireActionSlot(ctx)
+	if err != nil {
+		return s3response.CopyObjectOutput{}, err
+	}
+	defer release()
+
 	if input.Key == nil {
 		return s3response.CopyObjectOutput{}, s3err.GetAPIError(s3err.ErrInvalidCopyDest)
 	}
@@ -3972,8 +4606,15 @@ func (p *Posix) CopyObject(ctx context.Context, input s3response.CopyObjectInput
 	if err != nil {
 		return s3response.CopyObjectOutput{}, err
 	}
+	if !p.isBucketValid(srcBucket) {
+		return s3response.CopyObjectOutput{}, s3err.GetAPIError(s3err.ErrInvalidBucketName)
+	}
 	dstBucket := *input.Bucket
 	dstObject := *input.Key
+
+	if !p.isBucketValid(dstBucket) {
+		return s3response.CopyObjectOutput{}, s3err.GetAPIError(s3err.ErrInvalidBucketName)
+	}
 
 	_, err = os.Stat(srcBucket)
 	if errors.Is(err, fs.ErrNotExist) {
@@ -4058,9 +4699,6 @@ func (p *Posix) CopyObject(ctx context.Context, input s3response.CopyObjectInput
 		return s3response.CopyObjectOutput{}, err
 	}
 
-	mdmap := make(map[string]string)
-	p.loadObjectMetaData(nil, srcBucket, srcObject, &fi, mdmap)
-
 	var etag string
 	var version *string
 	var crc32 *string
@@ -4077,20 +4715,9 @@ func (p *Posix) CopyObject(ctx context.Context, input s3response.CopyObjectInput
 		}
 
 		// Delete the object metadata
-		for k := range mdmap {
-			err := p.meta.DeleteAttribute(dstBucket, dstObject,
-				fmt.Sprintf("%v.%v", metaHdr, k))
-			if err != nil && !errors.Is(err, meta.ErrNoSuchKey) {
-				return s3response.CopyObjectOutput{}, fmt.Errorf("delete user metadata: %w", err)
-			}
-		}
-		// Store the new metadata
-		for k, v := range input.Metadata {
-			err := p.meta.StoreAttribute(nil, dstBucket, dstObject,
-				fmt.Sprintf("%v.%v", metaHdr, k), []byte(v))
-			if err != nil {
-				return s3response.CopyObjectOutput{}, fmt.Errorf("set user attr %q: %w", k, err)
-			}
+		err = p.meta.DeleteAttribute(dstBucket, dstObject, metadataHdr)
+		if err != nil && !errors.Is(err, meta.ErrNoSuchKey) {
+			return s3response.CopyObjectOutput{}, fmt.Errorf("delete object metadata: %w", err)
 		}
 
 		checksums, err := p.retrieveChecksums(nil, dstBucket, dstObject)
@@ -4161,14 +4788,15 @@ func (p *Posix) CopyObject(ctx context.Context, input s3response.CopyObjectInput
 		version = backend.GetPtrFromString(string(vId))
 
 		// Store the provided object meta properties
-		err = p.storeObjectMetadata(nil, dstBucket, dstObject,
-			objectMetadata{
+		err = p.storeObjectMetaProperties(nil, dstBucket, dstObject,
+			metaProperties{
 				ContentType:        input.ContentType,
 				ContentEncoding:    input.ContentEncoding,
 				ContentLanguage:    input.ContentLanguage,
 				ContentDisposition: input.ContentDisposition,
 				CacheControl:       input.CacheControl,
 				Expires:            input.Expires,
+				Metadata:           input.Metadata,
 			})
 		if err != nil {
 			return s3response.CopyObjectOutput{}, err
@@ -4180,7 +4808,7 @@ func (p *Posix) CopyObject(ctx context.Context, input s3response.CopyObjectInput
 				return s3response.CopyObjectOutput{}, err
 			}
 
-			err = p.PutObjectTagging(ctx, dstBucket, dstObject, tags)
+			err = p.PutObjectTagging(withCtxNoSlot(ctx), dstBucket, dstObject, "", tags)
 			if err != nil {
 				return s3response.CopyObjectOutput{}, err
 			}
@@ -4219,14 +4847,14 @@ func (p *Posix) CopyObject(ctx context.Context, input s3response.CopyObjectInput
 
 		// load and pass the source object meta properties, if metadata directive is "COPY"
 		if input.MetadataDirective != types.MetadataDirectiveReplace {
-			metaProps := p.loadObjectMetaData(nil, srcBucket, srcObject, &fi, nil)
+			metaProps := p.loadObjectMetaProperties(nil, srcBucket, srcObject, &fi)
 			putObjectInput.ContentEncoding = metaProps.ContentEncoding
 			putObjectInput.ContentDisposition = metaProps.ContentDisposition
 			putObjectInput.ContentLanguage = metaProps.ContentLanguage
 			putObjectInput.ContentType = metaProps.ContentType
 			putObjectInput.CacheControl = metaProps.CacheControl
 			putObjectInput.Expires = metaProps.Expires
-			putObjectInput.Metadata = mdmap
+			putObjectInput.Metadata = metaProps.Metadata
 		}
 
 		// pass the input tagging to PutObject, if tagging directive is "REPLACE"
@@ -4234,7 +4862,7 @@ func (p *Posix) CopyObject(ctx context.Context, input s3response.CopyObjectInput
 			putObjectInput.Tagging = input.Tagging
 		}
 
-		res, err := p.PutObject(ctx, putObjectInput)
+		res, err := p.PutObject(withCtxNoSlot(ctx), putObjectInput)
 		if err != nil {
 			return s3response.CopyObjectOutput{}, err
 		}
@@ -4286,6 +4914,12 @@ func (p *Posix) CopyObject(ctx context.Context, input s3response.CopyObjectInput
 }
 
 func (p *Posix) ListObjects(ctx context.Context, input *s3.ListObjectsInput) (s3response.ListObjectsResult, error) {
+	release, err := p.acquireActionSlot(ctx)
+	if err != nil {
+		return s3response.ListObjectsResult{}, err
+	}
+	defer release()
+
 	return p.ListObjectsParametrized(ctx, input, p.FileToObj)
 }
 
@@ -4306,6 +4940,10 @@ func (p *Posix) ListObjectsParametrized(ctx context.Context, input *s3.ListObjec
 	maxkeys := int32(0)
 	if input.MaxKeys != nil {
 		maxkeys = *input.MaxKeys
+	}
+
+	if !p.isBucketValid(bucket) {
+		return s3response.ListObjectsResult{}, s3err.GetAPIError(s3err.ErrInvalidBucketName)
 	}
 
 	_, err := os.Stat(bucket)
@@ -4337,9 +4975,15 @@ func (p *Posix) ListObjectsParametrized(ctx context.Context, input *s3.ListObjec
 }
 
 func (p *Posix) FileToObj(bucket string, fetchOwner bool) backend.GetObjFunc {
+	if !p.isBucketValid(bucket) {
+		return func(string, fs.DirEntry) (s3response.Object, error) {
+			return s3response.Object{}, s3err.GetAPIError(s3err.ErrInvalidBucketName)
+		}
+	}
+
 	return func(path string, d fs.DirEntry) (s3response.Object, error) {
 		var owner *types.Owner
-		// Retreive the object owner data from bucket ACL, if fetchOwner is true
+		// Retrieve the object owner data from bucket ACL, if fetchOwner is true
 		// All the objects in the bucket are owned by the bucket owner
 		if fetchOwner {
 			aclJSON, err := p.meta.RetrieveAttribute(nil, bucket, "", aclkey)
@@ -4395,7 +5039,7 @@ func (p *Posix) FileToObj(bucket string, fetchOwner bool) backend.GetObjFunc {
 			return s3response.Object{}, backend.ErrSkipObj
 		}
 
-		// Retreive the object checksum algorithm
+		// Retrieve the object checksum algorithm
 		checksums, err := p.retrieveChecksums(nil, bucket, path)
 		if err != nil && !errors.Is(err, meta.ErrNoSuchKey) {
 			return s3response.Object{}, backend.ErrSkipObj
@@ -4439,6 +5083,12 @@ func (p *Posix) FileToObj(bucket string, fetchOwner bool) backend.GetObjFunc {
 }
 
 func (p *Posix) ListObjectsV2(ctx context.Context, input *s3.ListObjectsV2Input) (s3response.ListObjectsV2Result, error) {
+	release, err := p.acquireActionSlot(ctx)
+	if err != nil {
+		return s3response.ListObjectsV2Result{}, err
+	}
+	defer release()
+
 	return p.ListObjectsV2Parametrized(ctx, input, p.FileToObj)
 }
 
@@ -4467,6 +5117,10 @@ func (p *Posix) ListObjectsV2Parametrized(ctx context.Context, input *s3.ListObj
 	var fetchOwner bool
 	if input.FetchOwner != nil {
 		fetchOwner = *input.FetchOwner
+	}
+
+	if !p.isBucketValid(bucket) {
+		return s3response.ListObjectsV2Result{}, s3err.GetAPIError(s3err.ErrInvalidBucketName)
 	}
 
 	_, err := os.Stat(bucket)
@@ -4501,8 +5155,17 @@ func (p *Posix) ListObjectsV2Parametrized(ctx context.Context, input *s3.ListObj
 	}, nil
 }
 
-func (p *Posix) PutBucketAcl(_ context.Context, bucket string, data []byte) error {
-	_, err := os.Stat(bucket)
+func (p *Posix) PutBucketAcl(ctx context.Context, bucket string, data []byte) error {
+	release, err := p.acquireActionSlot(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	if !p.isBucketValid(bucket) {
+		return s3err.GetAPIError(s3err.ErrInvalidBucketName)
+	}
+	_, err = os.Stat(bucket)
 	if errors.Is(err, fs.ErrNotExist) {
 		return s3err.GetAPIError(s3err.ErrNoSuchBucket)
 	}
@@ -4518,8 +5181,17 @@ func (p *Posix) PutBucketAcl(_ context.Context, bucket string, data []byte) erro
 	return nil
 }
 
-func (p *Posix) GetBucketAcl(_ context.Context, input *s3.GetBucketAclInput) ([]byte, error) {
-	_, err := os.Stat(*input.Bucket)
+func (p *Posix) GetBucketAcl(ctx context.Context, input *s3.GetBucketAclInput) ([]byte, error) {
+	release, err := p.acquireActionSlot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
+	if !p.isBucketValid(*input.Bucket) {
+		return nil, s3err.GetAPIError(s3err.ErrInvalidBucketName)
+	}
+	_, err = os.Stat(*input.Bucket)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, s3err.GetAPIError(s3err.ErrNoSuchBucket)
 	}
@@ -4537,8 +5209,17 @@ func (p *Posix) GetBucketAcl(_ context.Context, input *s3.GetBucketAclInput) ([]
 	return b, nil
 }
 
-func (p *Posix) PutBucketTagging(_ context.Context, bucket string, tags map[string]string) error {
-	_, err := os.Stat(bucket)
+func (p *Posix) PutBucketTagging(ctx context.Context, bucket string, tags map[string]string) error {
+	release, err := p.acquireActionSlot(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	if !p.isBucketValid(bucket) {
+		return s3err.GetAPIError(s3err.ErrInvalidBucketName)
+	}
+	_, err = os.Stat(bucket)
 	if errors.Is(err, fs.ErrNotExist) {
 		return s3err.GetAPIError(s3err.ErrNoSuchBucket)
 	}
@@ -4568,8 +5249,17 @@ func (p *Posix) PutBucketTagging(_ context.Context, bucket string, tags map[stri
 	return nil
 }
 
-func (p *Posix) GetBucketTagging(_ context.Context, bucket string) (map[string]string, error) {
-	_, err := os.Stat(bucket)
+func (p *Posix) GetBucketTagging(ctx context.Context, bucket string) (map[string]string, error) {
+	release, err := p.acquireActionSlot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
+	if !p.isBucketValid(bucket) {
+		return nil, s3err.GetAPIError(s3err.ErrInvalidBucketName)
+	}
+	_, err = os.Stat(bucket)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, s3err.GetAPIError(s3err.ErrNoSuchBucket)
 	}
@@ -4577,7 +5267,7 @@ func (p *Posix) GetBucketTagging(_ context.Context, bucket string) (map[string]s
 		return nil, fmt.Errorf("stat bucket: %w", err)
 	}
 
-	tags, err := p.getAttrTags(bucket, "")
+	tags, err := p.getAttrTags(bucket, "", "")
 	if err != nil {
 		return nil, err
 	}
@@ -4586,11 +5276,23 @@ func (p *Posix) GetBucketTagging(_ context.Context, bucket string) (map[string]s
 }
 
 func (p *Posix) DeleteBucketTagging(ctx context.Context, bucket string) error {
+	if !p.isBucketValid(bucket) {
+		return s3err.GetAPIError(s3err.ErrInvalidBucketName)
+	}
 	return p.PutBucketTagging(ctx, bucket, nil)
 }
 
-func (p *Posix) GetObjectTagging(_ context.Context, bucket, object string) (map[string]string, error) {
-	_, err := os.Stat(bucket)
+func (p *Posix) GetObjectTagging(ctx context.Context, bucket, object, versionId string) (map[string]string, error) {
+	release, err := p.acquireActionSlot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
+	if !p.isBucketValid(bucket) {
+		return nil, s3err.GetAPIError(s3err.ErrInvalidBucketName)
+	}
+	_, err = os.Stat(bucket)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, s3err.GetAPIError(s3err.ErrNoSuchBucket)
 	}
@@ -4598,16 +5300,47 @@ func (p *Posix) GetObjectTagging(_ context.Context, bucket, object string) (map[
 		return nil, fmt.Errorf("stat bucket: %w", err)
 	}
 
-	return p.getAttrTags(bucket, object)
+	if versionId != "" {
+		if !p.versioningEnabled() {
+			//TODO: Maybe we need to return our custom error here?
+			return nil, s3err.GetAPIError(s3err.ErrInvalidVersionId)
+		}
+		vId, err := p.meta.RetrieveAttribute(nil, bucket, object, versionIdKey)
+		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+			return nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
+		}
+		if err != nil && !errors.Is(err, meta.ErrNoSuchKey) {
+			return nil, fmt.Errorf("get obj versionId: %w", err)
+		}
+
+		if string(vId) != versionId {
+			bucket = filepath.Join(p.versioningDir, bucket)
+			object = filepath.Join(genObjVersionKey(object), versionId)
+		}
+	}
+
+	err = p.ensureNotDeleteMarker(bucket, object, versionId)
+	if err != nil {
+		return nil, err
+	}
+
+	return p.getAttrTags(bucket, object, versionId)
 }
 
-func (p *Posix) getAttrTags(bucket, object string) (map[string]string, error) {
+func (p *Posix) getAttrTags(bucket, object, versionId string) (map[string]string, error) {
 	tags := make(map[string]string)
 	b, err := p.meta.RetrieveAttribute(nil, bucket, object, tagHdr)
 	if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+		if versionId != "" {
+			return nil, s3err.GetAPIError(s3err.ErrNoSuchVersion)
+		}
 		return nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
 	}
 	if errors.Is(err, meta.ErrNoSuchKey) {
+		if object != "" {
+			// return empty tag set for object tagging
+			return tags, nil
+		}
 		return nil, s3err.GetAPIError(s3err.ErrBucketTaggingNotFound)
 	}
 	if err != nil {
@@ -4622,8 +5355,17 @@ func (p *Posix) getAttrTags(bucket, object string) (map[string]string, error) {
 	return tags, nil
 }
 
-func (p *Posix) PutObjectTagging(_ context.Context, bucket, object string, tags map[string]string) error {
-	_, err := os.Stat(bucket)
+func (p *Posix) PutObjectTagging(ctx context.Context, bucket, object, versionId string, tags map[string]string) error {
+	release, err := p.acquireActionSlot(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	if !p.isBucketValid(bucket) {
+		return s3err.GetAPIError(s3err.ErrInvalidBucketName)
+	}
+	_, err = os.Stat(bucket)
 	if errors.Is(err, fs.ErrNotExist) {
 		return s3err.GetAPIError(s3err.ErrNoSuchBucket)
 	}
@@ -4631,9 +5373,36 @@ func (p *Posix) PutObjectTagging(_ context.Context, bucket, object string, tags 
 		return fmt.Errorf("stat bucket: %w", err)
 	}
 
+	if versionId != "" {
+		if !p.versioningEnabled() {
+			//TODO: Maybe we need to return our custom error here?
+			return s3err.GetAPIError(s3err.ErrInvalidVersionId)
+		}
+		vId, err := p.meta.RetrieveAttribute(nil, bucket, object, versionIdKey)
+		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+			return s3err.GetAPIError(s3err.ErrNoSuchKey)
+		}
+		if err != nil && !errors.Is(err, meta.ErrNoSuchKey) {
+			return fmt.Errorf("get obj versionId: %w", err)
+		}
+
+		if string(vId) != versionId {
+			bucket = filepath.Join(p.versioningDir, bucket)
+			object = filepath.Join(genObjVersionKey(object), versionId)
+		}
+	}
+
+	err = p.ensureNotDeleteMarker(bucket, object, versionId)
+	if err != nil {
+		return err
+	}
+
 	if tags == nil {
 		err = p.meta.DeleteAttribute(bucket, object, tagHdr)
 		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+			if versionId != "" {
+				return s3err.GetAPIError(s3err.ErrNoSuchVersion)
+			}
 			return s3err.GetAPIError(s3err.ErrNoSuchKey)
 		}
 		if errors.Is(err, meta.ErrNoSuchKey) {
@@ -4652,6 +5421,9 @@ func (p *Posix) PutObjectTagging(_ context.Context, bucket, object string, tags 
 
 	err = p.meta.StoreAttribute(nil, bucket, object, tagHdr, b)
 	if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+		if versionId != "" {
+			return s3err.GetAPIError(s3err.ErrNoSuchVersion)
+		}
 		return s3err.GetAPIError(s3err.ErrNoSuchKey)
 	}
 	if err != nil {
@@ -4661,12 +5433,24 @@ func (p *Posix) PutObjectTagging(_ context.Context, bucket, object string, tags 
 	return nil
 }
 
-func (p *Posix) DeleteObjectTagging(ctx context.Context, bucket, object string) error {
-	return p.PutObjectTagging(ctx, bucket, object, nil)
+func (p *Posix) DeleteObjectTagging(ctx context.Context, bucket, object, versionId string) error {
+	if !p.isBucketValid(bucket) {
+		return s3err.GetAPIError(s3err.ErrInvalidBucketName)
+	}
+	return p.PutObjectTagging(ctx, bucket, object, versionId, nil)
 }
 
 func (p *Posix) PutBucketPolicy(ctx context.Context, bucket string, policy []byte) error {
-	_, err := os.Stat(bucket)
+	release, err := p.acquireActionSlot(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	if !p.isBucketValid(bucket) {
+		return s3err.GetAPIError(s3err.ErrInvalidBucketName)
+	}
+	_, err = os.Stat(bucket)
 	if errors.Is(err, fs.ErrNotExist) {
 		return s3err.GetAPIError(s3err.ErrNoSuchBucket)
 	}
@@ -4696,7 +5480,16 @@ func (p *Posix) PutBucketPolicy(ctx context.Context, bucket string, policy []byt
 }
 
 func (p *Posix) GetBucketPolicy(ctx context.Context, bucket string) ([]byte, error) {
-	_, err := os.Stat(bucket)
+	release, err := p.acquireActionSlot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
+	if !p.isBucketValid(bucket) {
+		return nil, s3err.GetAPIError(s3err.ErrInvalidBucketName)
+	}
+	_, err = os.Stat(bucket)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, s3err.GetAPIError(s3err.ErrNoSuchBucket)
 	}
@@ -4719,11 +5512,23 @@ func (p *Posix) GetBucketPolicy(ctx context.Context, bucket string) ([]byte, err
 }
 
 func (p *Posix) DeleteBucketPolicy(ctx context.Context, bucket string) error {
+	if !p.isBucketValid(bucket) {
+		return s3err.GetAPIError(s3err.ErrInvalidBucketName)
+	}
 	return p.PutBucketPolicy(ctx, bucket, nil)
 }
 
-func (p *Posix) PutBucketCors(_ context.Context, bucket string, cors []byte) error {
-	_, err := os.Stat(bucket)
+func (p *Posix) PutBucketCors(ctx context.Context, bucket string, cors []byte) error {
+	release, err := p.acquireActionSlot(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	if !p.isBucketValid(bucket) {
+		return s3err.GetAPIError(s3err.ErrInvalidBucketName)
+	}
+	_, err = os.Stat(bucket)
 	if errors.Is(err, fs.ErrNotExist) {
 		return s3err.GetAPIError(s3err.ErrNoSuchBucket)
 	}
@@ -4748,8 +5553,17 @@ func (p *Posix) PutBucketCors(_ context.Context, bucket string, cors []byte) err
 	return nil
 }
 
-func (p *Posix) GetBucketCors(_ context.Context, bucket string) ([]byte, error) {
-	_, err := os.Stat(bucket)
+func (p *Posix) GetBucketCors(ctx context.Context, bucket string) ([]byte, error) {
+	release, err := p.acquireActionSlot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
+	if !p.isBucketValid(bucket) {
+		return nil, s3err.GetAPIError(s3err.ErrInvalidBucketName)
+	}
+	_, err = os.Stat(bucket)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, s3err.GetAPIError(s3err.ErrNoSuchBucket)
 	}
@@ -4769,6 +5583,9 @@ func (p *Posix) GetBucketCors(_ context.Context, bucket string) ([]byte, error) 
 }
 
 func (p *Posix) DeleteBucketCors(ctx context.Context, bucket string) error {
+	if !p.isBucketValid(bucket) {
+		return s3err.GetAPIError(s3err.ErrInvalidBucketName)
+	}
 	return p.PutBucketCors(ctx, bucket, nil)
 }
 
@@ -4778,7 +5595,7 @@ func (p *Posix) isBucketObjectLockEnabled(bucket string) error {
 		return s3err.GetAPIError(s3err.ErrNoSuchBucket)
 	}
 	if errors.Is(err, meta.ErrNoSuchKey) {
-		return s3err.GetAPIError(s3err.ErrInvalidBucketObjectLockConfiguration)
+		return s3err.GetAPIError(s3err.ErrMissingObjectLockConfiguration)
 	}
 	if err != nil {
 		return fmt.Errorf("get object lock config: %w", err)
@@ -4790,14 +5607,23 @@ func (p *Posix) isBucketObjectLockEnabled(bucket string) error {
 	}
 
 	if !bucketLockConfig.Enabled {
-		return s3err.GetAPIError(s3err.ErrInvalidBucketObjectLockConfiguration)
+		return s3err.GetAPIError(s3err.ErrMissingObjectLockConfiguration)
 	}
 
 	return nil
 }
 
 func (p *Posix) PutObjectLockConfiguration(ctx context.Context, bucket string, config []byte) error {
-	_, err := os.Stat(bucket)
+	release, err := p.acquireActionSlot(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	if !p.isBucketValid(bucket) {
+		return s3err.GetAPIError(s3err.ErrInvalidBucketName)
+	}
+	_, err = os.Stat(bucket)
 	if errors.Is(err, fs.ErrNotExist) {
 		return s3err.GetAPIError(s3err.ErrNoSuchBucket)
 	}
@@ -4805,21 +5631,21 @@ func (p *Posix) PutObjectLockConfiguration(ctx context.Context, bucket string, c
 		return fmt.Errorf("stat bucket: %w", err)
 	}
 
-	cfg, err := p.meta.RetrieveAttribute(nil, bucket, "", bucketLockKey)
-	if errors.Is(err, meta.ErrNoSuchKey) {
-		return s3err.GetAPIError(s3err.ErrObjectLockConfigurationNotAllowed)
-	}
-	if err != nil {
-		return fmt.Errorf("get object lock config: %w", err)
-	}
+	if p.versioningEnabled() {
+		// if versioning is enabled on gateway level and bucket versioning
+		// status is not `Enabled`, object lock can't be enabled.
+		// if object lock has been enabled on bucket creation
+		// it means the versioning has been enabled alongside with object lock
+		// and it can't be suspended ever again
+		status, err := p.getBucketVersioningStatus(ctx, bucket)
+		if err != nil {
+			return err
+		}
 
-	var bucketLockCfg auth.BucketLockConfig
-	if err := json.Unmarshal(cfg, &bucketLockCfg); err != nil {
-		return fmt.Errorf("unmarshal object lock config: %w", err)
-	}
-
-	if !bucketLockCfg.Enabled {
-		return s3err.GetAPIError(s3err.ErrObjectLockConfigurationNotAllowed)
+		if status != types.BucketVersioningStatusEnabled {
+			// if versioning is enabled on gateway level
+			return s3err.GetAPIError(s3err.ErrObjectLockConfigurationNotAllowed)
+		}
 	}
 
 	err = p.meta.StoreAttribute(nil, bucket, "", bucketLockKey, config)
@@ -4830,8 +5656,17 @@ func (p *Posix) PutObjectLockConfiguration(ctx context.Context, bucket string, c
 	return nil
 }
 
-func (p *Posix) GetObjectLockConfiguration(_ context.Context, bucket string) ([]byte, error) {
-	_, err := os.Stat(bucket)
+func (p *Posix) GetObjectLockConfiguration(ctx context.Context, bucket string) ([]byte, error) {
+	release, err := p.acquireActionSlot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
+	if !p.isBucketValid(bucket) {
+		return nil, s3err.GetAPIError(s3err.ErrInvalidBucketName)
+	}
+	_, err = os.Stat(bucket)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, s3err.GetAPIError(s3err.ErrNoSuchBucket)
 	}
@@ -4850,8 +5685,17 @@ func (p *Posix) GetObjectLockConfiguration(_ context.Context, bucket string) ([]
 	return cfg, nil
 }
 
-func (p *Posix) PutObjectLegalHold(_ context.Context, bucket, object, versionId string, status bool) error {
-	err := p.doesBucketAndObjectExist(bucket, object)
+func (p *Posix) PutObjectLegalHold(ctx context.Context, bucket, object, versionId string, status bool) error {
+	release, err := p.acquireActionSlot(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	if !p.isBucketValid(bucket) {
+		return s3err.GetAPIError(s3err.ErrInvalidBucketName)
+	}
+	err = p.doesBucketAndObjectExist(bucket, object)
 	if err != nil {
 		return err
 	}
@@ -4886,10 +5730,15 @@ func (p *Posix) PutObjectLegalHold(_ context.Context, bucket, object, versionId 
 		}
 	}
 
+	err = p.ensureNotDeleteMarker(bucket, object, versionId)
+	if err != nil {
+		return err
+	}
+
 	err = p.meta.StoreAttribute(nil, bucket, object, objectLegalHoldKey, statusData)
 	if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
 		if versionId != "" {
-			return s3err.GetAPIError(s3err.ErrInvalidVersionId)
+			return s3err.GetAPIError(s3err.ErrNoSuchVersion)
 		}
 		return s3err.GetAPIError(s3err.ErrNoSuchKey)
 	}
@@ -4900,8 +5749,17 @@ func (p *Posix) PutObjectLegalHold(_ context.Context, bucket, object, versionId 
 	return nil
 }
 
-func (p *Posix) GetObjectLegalHold(_ context.Context, bucket, object, versionId string) (*bool, error) {
-	err := p.doesBucketAndObjectExist(bucket, object)
+func (p *Posix) GetObjectLegalHold(ctx context.Context, bucket, object, versionId string) (*bool, error) {
+	release, err := p.acquireActionSlot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
+	if !p.isBucketValid(bucket) {
+		return nil, s3err.GetAPIError(s3err.ErrInvalidBucketName)
+	}
+	err = p.doesBucketAndObjectExist(bucket, object)
 	if err != nil {
 		return nil, err
 	}
@@ -4929,10 +5787,15 @@ func (p *Posix) GetObjectLegalHold(_ context.Context, bucket, object, versionId 
 		}
 	}
 
+	err = p.ensureNotDeleteMarker(bucket, object, versionId)
+	if err != nil {
+		return nil, err
+	}
+
 	data, err := p.meta.RetrieveAttribute(nil, bucket, object, objectLegalHoldKey)
 	if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
 		if versionId != "" {
-			return nil, s3err.GetAPIError(s3err.ErrInvalidVersionId)
+			return nil, s3err.GetAPIError(s3err.ErrNoSuchVersion)
 		}
 		return nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
 	}
@@ -4948,8 +5811,17 @@ func (p *Posix) GetObjectLegalHold(_ context.Context, bucket, object, versionId 
 	return &result, nil
 }
 
-func (p *Posix) PutObjectRetention(_ context.Context, bucket, object, versionId string, bypass bool, retention []byte) error {
-	err := p.doesBucketAndObjectExist(bucket, object)
+func (p *Posix) PutObjectRetention(ctx context.Context, bucket, object, versionId string, retention []byte) error {
+	release, err := p.acquireActionSlot(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	if !p.isBucketValid(bucket) {
+		return s3err.GetAPIError(s3err.ErrInvalidBucketName)
+	}
+	err = p.doesBucketAndObjectExist(bucket, object)
 	if err != nil {
 		return err
 	}
@@ -4977,39 +5849,9 @@ func (p *Posix) PutObjectRetention(_ context.Context, bucket, object, versionId 
 		}
 	}
 
-	objectLockCfg, err := p.meta.RetrieveAttribute(nil, bucket, object, objectRetentionKey)
-	if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
-		if versionId != "" {
-			return s3err.GetAPIError(s3err.ErrInvalidVersionId)
-		}
-		return s3err.GetAPIError(s3err.ErrNoSuchKey)
-	}
-	if errors.Is(err, meta.ErrNoSuchKey) {
-		err := p.meta.StoreAttribute(nil, bucket, object, objectRetentionKey, retention)
-		if err != nil {
-			return fmt.Errorf("set object lock config: %w", err)
-		}
-
-		return nil
-	}
+	err = p.ensureNotDeleteMarker(bucket, object, versionId)
 	if err != nil {
-		return fmt.Errorf("get object lock config: %w", err)
-	}
-
-	var lockCfg types.ObjectLockRetention
-	if err := json.Unmarshal(objectLockCfg, &lockCfg); err != nil {
-		return fmt.Errorf("unmarshal object lock config: %w", err)
-	}
-
-	switch lockCfg.Mode {
-	// Compliance mode can't be overridden
-	case types.ObjectLockRetentionModeCompliance:
-		return s3err.GetAPIError(s3err.ErrMethodNotAllowed)
-	// To override governance mode user should have "s3:BypassGovernanceRetention" permission
-	case types.ObjectLockRetentionModeGovernance:
-		if !bypass {
-			return s3err.GetAPIError(s3err.ErrMethodNotAllowed)
-		}
+		return err
 	}
 
 	err = p.meta.StoreAttribute(nil, bucket, object, objectRetentionKey, retention)
@@ -5020,8 +5862,17 @@ func (p *Posix) PutObjectRetention(_ context.Context, bucket, object, versionId 
 	return nil
 }
 
-func (p *Posix) GetObjectRetention(_ context.Context, bucket, object, versionId string) ([]byte, error) {
-	err := p.doesBucketAndObjectExist(bucket, object)
+func (p *Posix) GetObjectRetention(ctx context.Context, bucket, object, versionId string) ([]byte, error) {
+	release, err := p.acquireActionSlot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
+	if !p.isBucketValid(bucket) {
+		return nil, s3err.GetAPIError(s3err.ErrInvalidBucketName)
+	}
+	err = p.doesBucketAndObjectExist(bucket, object)
 	if err != nil {
 		return nil, err
 	}
@@ -5049,10 +5900,15 @@ func (p *Posix) GetObjectRetention(_ context.Context, bucket, object, versionId 
 		}
 	}
 
+	err = p.ensureNotDeleteMarker(bucket, object, versionId)
+	if err != nil {
+		return nil, err
+	}
+
 	data, err := p.meta.RetrieveAttribute(nil, bucket, object, objectRetentionKey)
 	if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
 		if versionId != "" {
-			return nil, s3err.GetAPIError(s3err.ErrInvalidVersionId)
+			return nil, s3err.GetAPIError(s3err.ErrNoSuchVersion)
 		}
 		return nil, s3err.GetAPIError(s3err.ErrNoSuchKey)
 	}
@@ -5067,6 +5923,15 @@ func (p *Posix) GetObjectRetention(_ context.Context, bucket, object, versionId 
 }
 
 func (p *Posix) ChangeBucketOwner(ctx context.Context, bucket, owner string) error {
+	release, err := p.acquireActionSlot(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	if !p.isBucketValid(bucket) {
+		return s3err.GetAPIError(s3err.ErrInvalidBucketName)
+	}
 	return auth.UpdateBucketACLOwner(ctx, p, bucket, owner)
 }
 
@@ -5103,6 +5968,12 @@ func listBucketFileInfos(bucketlinks bool) ([]fs.FileInfo, error) {
 }
 
 func (p *Posix) ListBucketsAndOwners(ctx context.Context) (buckets []s3response.Bucket, err error) {
+	release, err := p.acquireActionSlot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
 	fis, err := listBucketFileInfos(p.bucketlinks)
 	if err != nil {
 		return buckets, fmt.Errorf("listBucketFileInfos: %w", err)

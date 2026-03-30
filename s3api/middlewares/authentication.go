@@ -17,9 +17,7 @@ package middlewares
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"fmt"
 	"io"
-	"net/http"
 	"strconv"
 	"time"
 
@@ -32,6 +30,7 @@ import (
 const (
 	iso8601Format   = "20060102T150405Z"
 	maxObjSizeLimit = 5 * 1024 * 1024 * 1024 // 5gb
+	defaultRegion   = "us-east-1"
 )
 
 type RootUserConfig struct {
@@ -39,7 +38,7 @@ type RootUserConfig struct {
 	Secret string
 }
 
-func VerifyV4Signature(root RootUserConfig, iam auth.IAMService, region string) fiber.Handler {
+func VerifyV4Signature(root RootUserConfig, iam auth.IAMService, region string, streamBody, requireContentSha256, allowDefaultRegion bool) fiber.Handler {
 	acct := accounts{root: root, iam: iam}
 
 	return func(ctx *fiber.Ctx) error {
@@ -52,9 +51,27 @@ func VerifyV4Signature(root RootUserConfig, iam auth.IAMService, region string) 
 			return nil
 		}
 
+		// Check X-Amz-Date header
+		date := ctx.Get("X-Amz-Date")
+		if date == "" {
+			return s3err.GetAPIError(s3err.ErrMissingDateHeader)
+		}
+
+		// Parse the date and check the date validity
+		tdate, err := time.Parse(iso8601Format, date)
+		if err != nil {
+			return s3err.GetAPIError(s3err.ErrMissingDateHeader)
+		}
+
+		// Validate the dates difference
+		err = utils.ValidateDate(tdate)
+		if err != nil {
+			return err
+		}
+
 		authorization := ctx.Get("Authorization")
 		if authorization == "" {
-			return s3err.GetAPIError(s3err.ErrAuthHeaderEmpty)
+			return s3err.GetAPIError(s3err.ErrInvalidAuthHeader)
 		}
 
 		authData, err := utils.ParseAuthorization(authorization)
@@ -62,12 +79,8 @@ func VerifyV4Signature(root RootUserConfig, iam auth.IAMService, region string) 
 			return err
 		}
 
-		if authData.Region != region {
-			return s3err.APIError{
-				Code:           "SignatureDoesNotMatch",
-				Description:    fmt.Sprintf("Credential should be scoped to a valid Region, not %v", authData.Region),
-				HTTPStatusCode: http.StatusForbidden,
-			}
+		if authData.Region != region && !(allowDefaultRegion && authData.Region == defaultRegion) {
+			return s3err.MalformedAuth.IncorrectRegion(region, authData.Region)
 		}
 
 		utils.ContextKeyIsRoot.Set(ctx, authData.Access == root.Access)
@@ -80,29 +93,11 @@ func VerifyV4Signature(root RootUserConfig, iam auth.IAMService, region string) 
 			return err
 		}
 
-		utils.ContextKeyAccount.Set(ctx, account)
-
-		// Check X-Amz-Date header
-		date := ctx.Get("X-Amz-Date")
-		if date == "" {
-			return s3err.GetAPIError(s3err.ErrMissingDateHeader)
-		}
-
-		// Parse the date and check the date validity
-		tdate, err := time.Parse(iso8601Format, date)
-		if err != nil {
-			return s3err.GetAPIError(s3err.ErrMalformedDate)
-		}
-
 		if date[:8] != authData.Date {
-			return s3err.GetAPIError(s3err.ErrSignatureDateDoesNotMatch)
+			return s3err.MalformedAuth.DateMismatch()
 		}
 
-		// Validate the dates difference
-		err = utils.ValidateDate(tdate)
-		if err != nil {
-			return err
-		}
+		utils.ContextKeyAccount.Set(ctx, account)
 
 		var contentLength int64
 		contentLengthStr := ctx.Get("Content-Length")
@@ -115,10 +110,18 @@ func VerifyV4Signature(root RootUserConfig, iam auth.IAMService, region string) 
 		}
 
 		hashPayload := ctx.Get("X-Amz-Content-Sha256")
+		if requireContentSha256 && hashPayload == "" {
+			return s3err.GetAPIError(s3err.ErrMissingContentSha256)
+		}
 		if !utils.IsValidSh256PayloadHeader(hashPayload) {
 			return s3err.GetAPIError(s3err.ErrInvalidSHA256Paylod)
 		}
-		if utils.IsBigDataAction(ctx) {
+		// the streaming payload type is allowed only in PutObject and UploadPart
+		// e.g. STREAMING-UNSIGNED-PAYLOAD-TRAILER
+		if !streamBody && utils.IsStreamingPayload(hashPayload) {
+			return s3err.GetAPIError(s3err.ErrInvalidSHA256PayloadUsage)
+		}
+		if streamBody {
 			// for streaming PUT actions, authorization is deferred
 			// until end of stream due to need to get length and
 			// checksum of the stream to validate authorization
@@ -132,7 +135,7 @@ func VerifyV4Signature(root RootUserConfig, iam auth.IAMService, region string) 
 				var err error
 				wrapBodyReader(ctx, func(r io.Reader) io.Reader {
 					var cr io.Reader
-					cr, err = utils.NewChunkReader(ctx, r, authData, region, account.Secret, tdate)
+					cr, err = utils.NewChunkReader(ctx, r, authData, account.Secret, tdate)
 					return cr
 				})
 				if err != nil {
@@ -166,7 +169,7 @@ func VerifyV4Signature(root RootUserConfig, iam auth.IAMService, region string) 
 			}
 		}
 
-		err = utils.CheckValidSignature(ctx, authData, account.Secret, hashPayload, tdate, contentLength)
+		err = utils.CheckValidSignature(ctx, authData, account.Secret, hashPayload, tdate, contentLength, false)
 		if err != nil {
 			return err
 		}

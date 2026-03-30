@@ -16,7 +16,6 @@
 
 get_bucket_policy() {
   log 6 "get_bucket_policy '$1' '$2'"
-  record_command "get-bucket-policy" "client:$1"
   if ! check_param_count "get_bucket_policy" "command type, bucket" 2 $#; then
     return 1
   fi
@@ -42,7 +41,6 @@ get_bucket_policy() {
 
 get_bucket_policy_s3api() {
   log 6 "get_bucket_policy_s3api '$1'"
-  record_command "get-bucket-policy" "client:s3api"
   if ! check_param_count "get_bucket_policy_s3api" "bucket" 1 $#; then
     return 1
   fi
@@ -63,7 +61,6 @@ get_bucket_policy_s3api() {
 }
 
 get_bucket_policy_with_user() {
-  record_command "get-bucket-policy" "client:s3api"
   if ! check_param_count "get_bucket_policy_with_user" "bucket, username, password" 3 $#; then
     return 1
   fi
@@ -82,12 +79,11 @@ get_bucket_policy_with_user() {
 }
 
 get_bucket_policy_s3cmd() {
-  record_command "get-bucket-policy" "client:s3cmd"
   if ! check_param_count "get_bucket_policy_s3cmd" "bucket" 1 $#; then
     return 1
   fi
 
-  if ! info=$(send_command s3cmd "${S3CMD_OPTS[@]}" --no-check-certificate info "s3://$1" 2>&1); then
+  if ! info=$(send_command s3cmd "${S3CMD_OPTS[@]}" --no-check-certificate --region "$AWS_REGION" info "s3://$1" 2>&1); then
     log 2 "error getting bucket policy: $info"
     return 1
   fi
@@ -109,6 +105,7 @@ get_bucket_policy_rest() {
   if ! check_param_count "get_bucket_policy_rest" "bucket" 1 $#; then
     return 1
   fi
+  log 5 "aws region: $AWS_REGION"
   if ! get_bucket_policy_rest_expect_code "$1" "200"; then
     log 2 "error getting REST bucket policy"
     return 1
@@ -166,11 +163,10 @@ search_for_first_policy_line_or_full_policy() {
 }
 
 get_bucket_policy_mc() {
-  record_command "get-bucket-policy" "client:mc"
   if ! check_param_count "get_bucket_policy_mc" "bucket" 1 $#; then
     return 1
   fi
-  bucket_policy=$(send_command mc --insecure anonymous get-json "$MC_ALIAS/$1") || get_result=$?
+  bucket_policy=$(send_command mc --insecure anonymous get-json "$MC_ALIAS/$1" 2>&1) || get_result=$?
   if [[ $get_result -ne 0 ]]; then
     log 2 "error getting policy: $bucket_policy"
     return 1

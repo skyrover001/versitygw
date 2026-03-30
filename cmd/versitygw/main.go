@@ -16,16 +16,16 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
 	_ "net/http/pprof"
+	"net/url"
 	"os"
+	"strconv"
 	"strings"
 
-	"github.com/gofiber/fiber/v2"
 	"github.com/urfave/cli/v2"
 	"github.com/versity/versitygw/auth"
 	"github.com/versity/versitygw/backend"
@@ -33,56 +33,76 @@ import (
 	"github.com/versity/versitygw/metrics"
 	"github.com/versity/versitygw/s3api"
 	"github.com/versity/versitygw/s3api/middlewares"
+	"github.com/versity/versitygw/s3api/utils"
 	"github.com/versity/versitygw/s3event"
 	"github.com/versity/versitygw/s3log"
+	"github.com/versity/versitygw/webui"
 )
 
 var (
-	port, admPort                            string
-	rootUserAccess                           string
-	rootUserSecret                           string
-	region                                   string
-	admCertFile, admKeyFile                  string
-	certFile, keyFile                        string
-	kafkaURL, kafkaTopic, kafkaKey           string
-	natsURL, natsTopic                       string
-	rabbitmqURL, rabbitmqExchange            string
-	rabbitmqRoutingKey                       string
-	eventWebhookURL                          string
-	eventConfigFilePath                      string
-	logWebhookURL, accessLog                 string
-	adminLogFile                             string
-	healthPath                               string
-	virtualDomain                            string
-	debug                                    bool
-	keepAlive                                bool
-	pprof                                    string
-	quiet                                    bool
-	readonly                                 bool
-	iamDir                                   string
-	ldapURL, ldapBindDN, ldapPassword        string
-	ldapQueryBase, ldapObjClasses            string
-	ldapAccessAtr, ldapSecAtr, ldapRoleAtr   string
-	ldapUserIdAtr, ldapGroupIdAtr            string
-	vaultEndpointURL, vaultSecretStoragePath string
-	vaultAuthMethod, vaultMountPath          string
-	vaultRootToken, vaultRoleId              string
-	vaultRoleSecret, vaultServerCert         string
-	vaultClientCert, vaultClientCertKey      string
-	s3IamAccess, s3IamSecret                 string
-	s3IamRegion, s3IamBucket                 string
-	s3IamEndpoint                            string
-	s3IamSslNoVerify                         bool
-	iamCacheDisable                          bool
-	iamCacheTTL                              int
-	iamCachePrune                            int
-	metricsService                           string
-	statsdServers                            string
-	dogstatsServers                          string
-	ipaHost, ipaVaultName                    string
-	ipaUser, ipaPassword                     string
-	ipaInsecure                              bool
-	iamDebug                                 bool
+	ports                                  []string
+	admPorts                               []string
+	rootUserAccess                         string
+	rootUserSecret                         string
+	region                                 string
+	maxConnections, maxRequests            int
+	adminMaxConnections, adminMaxRequests  int
+	corsAllowOrigin                        string
+	admCertFile, admKeyFile                string
+	certFile, keyFile                      string
+	kafkaURL, kafkaTopic, kafkaKey         string
+	natsURL, natsTopic                     string
+	rabbitmqURL, rabbitmqExchange          string
+	rabbitmqRoutingKey                     string
+	eventWebhookURL                        string
+	eventConfigFilePath                    string
+	logWebhookURL, accessLog               string
+	adminLogFile                           string
+	healthPath                             string
+	virtualDomain                          string
+	debug                                  bool
+	keepAlive                              bool
+	pprof                                  string
+	quiet                                  bool
+	readonly                               bool
+	disableStrictBucketNames               bool
+	iamDir                                 string
+	ldapURL, ldapBindDN, ldapPassword      string
+	ldapQueryBase, ldapObjClasses          string
+	ldapAccessAtr, ldapSecAtr, ldapRoleAtr string
+	ldapUserIdAtr, ldapGroupIdAtr          string
+	ldapProjectIdAtr                       string
+	ldapTLSSkipVerify                      bool
+	vaultEndpointURL, vaultNamespace       string
+	vaultSecretStoragePath                 string
+	vaultSecretStorageNamespace            string
+	vaultAuthMethod, vaultAuthNamespace    string
+	vaultMountPath                         string
+	vaultRootToken, vaultRoleId            string
+	vaultRoleSecret, vaultServerCert       string
+	vaultClientCert, vaultClientCertKey    string
+	s3IamAccess, s3IamSecret               string
+	s3IamRegion, s3IamBucket               string
+	s3IamEndpoint                          string
+	s3IamSslNoVerify                       bool
+	iamCacheDisable                        bool
+	iamCacheTTL                            int
+	iamCachePrune                          int
+	metricsService                         string
+	statsdServers                          string
+	dogstatsServers                        string
+	ipaHost, ipaVaultName                  string
+	ipaUser, ipaPassword                   string
+	ipaInsecure                            bool
+	iamDebug                               bool
+	webuiPorts                             []string
+	webuiCertFile, webuiKeyFile            string
+	webuiNoTLS                             bool
+	webuiGateways                          []string
+	webuiAdminGateways                     []string
+	webuiPathPrefix                        string
+	webuiS3Prefix                          string
+	disableACLs                            bool
 )
 
 var (
@@ -131,6 +151,29 @@ VersityGW is an open-source project licensed under the Apache 2.0 License. The
 source code is hosted on GitHub at https://github.com/versity/versitygw, and
 documentation can be found in the GitHub wiki.`,
 		Copyright: "Copyright (c) 2023-2024 Versity Software",
+		Before: func(ctx *cli.Context) error {
+			// Initialize global variables from context (including default values)
+			ports = ctx.StringSlice("port")
+			webuiPorts = ctx.StringSlice("webui")
+			admPorts = ctx.StringSlice("admin-port")
+			webuiGateways = ctx.StringSlice("webui-gateways")
+			webuiAdminGateways = ctx.StringSlice("webui-admin-gateways")
+			webuiPathPrefix = ctx.String("webui-path-prefix")
+
+			// Resolve relative UNIX socket paths to absolute before any backend
+			// (e.g. posix) can change the working directory via os.Chdir.
+			var err error
+			if ports, err = utils.AbsSocketPaths(ports); err != nil {
+				return err
+			}
+			if admPorts, err = utils.AbsSocketPaths(admPorts); err != nil {
+				return err
+			}
+			if webuiPorts, err = utils.AbsSocketPaths(webuiPorts); err != nil {
+				return err
+			}
+			return nil
+		},
 		Action: func(ctx *cli.Context) error {
 			return ctx.App.Command("help").Run(ctx)
 		},
@@ -152,13 +195,57 @@ func initFlags() []cli.Flag {
 				return nil
 			},
 		},
+		&cli.StringSliceFlag{
+			Name:    "port",
+			Usage:   "gateway listen address: <ip>:<port>, :<port>, /path/to/socket for file-backed UNIX sockets, or @name for Linux abstract namespace sockets (can be specified multiple times for listening on multiple addresses)",
+			EnvVars: []string{"VGW_PORT"},
+			Value:   cli.NewStringSlice(":7070"),
+			Aliases: []string{"p"},
+		},
+		&cli.StringSliceFlag{
+			Name:    "webui",
+			Usage:   "enable WebUI server on the specified listen address (e.g. ':7071', '127.0.0.1:7071', 'localhost:7071', '/run/vgw/webui.sock'; supports the same UNIX socket forms as --port; can be specified multiple times for listening on multiple addresses; disabled when omitted)",
+			EnvVars: []string{"VGW_WEBUI_PORT"},
+		},
 		&cli.StringFlag{
-			Name:        "port",
-			Usage:       "gateway listen address <ip>:<port> or :<port>",
-			EnvVars:     []string{"VGW_PORT"},
-			Value:       ":7070",
-			Destination: &port,
-			Aliases:     []string{"p"},
+			Name:        "webui-cert",
+			Usage:       "TLS cert file for WebUI (defaults to --cert value when WebUI is enabled)",
+			EnvVars:     []string{"VGW_WEBUI_CERT"},
+			Destination: &webuiCertFile,
+		},
+		&cli.StringFlag{
+			Name:        "webui-key",
+			Usage:       "TLS key file for WebUI (defaults to --key value when WebUI is enabled)",
+			EnvVars:     []string{"VGW_WEBUI_KEY"},
+			Destination: &webuiKeyFile,
+		},
+		&cli.BoolFlag{
+			Name:        "webui-no-tls",
+			Usage:       "disable TLS for WebUI even if TLS is configured for the gateway",
+			EnvVars:     []string{"VGW_WEBUI_NO_TLS"},
+			Destination: &webuiNoTLS,
+		},
+		&cli.StringSliceFlag{
+			Name:    "webui-gateways",
+			Usage:   "override auto-detected S3 gateway URLs for WebUI (e.g. 'http://localhost:7070', 'https://s3.example.com'; can be specified multiple times)",
+			EnvVars: []string{"VGW_WEBUI_GATEWAYS"},
+		},
+		&cli.StringSliceFlag{
+			Name:    "webui-admin-gateways",
+			Usage:   "override auto-detected admin gateway URLs for WebUI (e.g. 'http://localhost:7080', 'https://admin.example.com'; can be specified multiple times)",
+			EnvVars: []string{"VGW_WEBUI_ADMIN_GATEWAYS"},
+		},
+		&cli.StringFlag{
+			Name:        "webui-path-prefix",
+			Usage:       "mount the WebUI under a path prefix (e.g. '/ui'); must be single segment path that starts with '/'",
+			EnvVars:     []string{"VGW_WEBUI_PATH_PREFIX"},
+			Destination: &webuiPathPrefix,
+		},
+		&cli.StringFlag{
+			Name:        "webui-s3-prefix",
+			Usage:       "mount the WebUI on the S3 port at the given path prefix (e.g. '/ui'); must start with '/', must not be '/', and must not end with '/'",
+			EnvVars:     []string{"VGW_WEBUI_S3_PREFIX"},
+			Destination: &webuiS3Prefix,
 		},
 		&cli.StringFlag{
 			Name:        "access",
@@ -182,6 +269,28 @@ func initFlags() []cli.Flag {
 			Destination: &region,
 			Aliases:     []string{"r"},
 		},
+		&cli.IntFlag{
+			Name:        "max-connections",
+			Usage:       "maximum number of concurrent connections s3 api server may serve",
+			EnvVars:     []string{"VGW_MAX_CONNECTIONS"},
+			Value:       250000,
+			Destination: &maxConnections,
+			Aliases:     []string{"mc"},
+		},
+		&cli.IntFlag{
+			Name:        "max-requests",
+			Usage:       "maximum number of in-flight requests s3 api server may serve",
+			EnvVars:     []string{"VGW_MAX_REQUESTS"},
+			Value:       100000,
+			Destination: &maxRequests,
+			Aliases:     []string{"mr"},
+		},
+		&cli.StringFlag{
+			Name:        "cors-allow-origin",
+			Usage:       "default CORS Access-Control-Allow-Origin value (applied when no bucket CORS configuration exists, and for admin APIs)",
+			EnvVars:     []string{"VGW_CORS_ALLOW_ORIGIN"},
+			Destination: &corsAllowOrigin,
+		},
 		&cli.StringFlag{
 			Name:        "cert",
 			Usage:       "TLS cert file",
@@ -194,12 +303,27 @@ func initFlags() []cli.Flag {
 			EnvVars:     []string{"VGW_KEY"},
 			Destination: &keyFile,
 		},
-		&cli.StringFlag{
-			Name:        "admin-port",
-			Usage:       "gateway admin server listen address <ip>:<port> or :<port>",
-			EnvVars:     []string{"VGW_ADMIN_PORT"},
-			Destination: &admPort,
-			Aliases:     []string{"ap"},
+		&cli.StringSliceFlag{
+			Name:    "admin-port",
+			Usage:   "gateway admin server listen address: <ip>:<port>, :<port>, /path/to/socket for file-backed UNIX sockets, or @name for Linux abstract namespace sockets (can be specified multiple times for listening on multiple addresses)",
+			EnvVars: []string{"VGW_ADMIN_PORT"},
+			Aliases: []string{"ap"},
+		},
+		&cli.IntFlag{
+			Name:        "admin-max-connections",
+			Usage:       "maximum number of concurrent connections s3 admin server may handle",
+			EnvVars:     []string{"VGW_ADMIN_MAX_CONNECTIONS"},
+			Value:       250000,
+			Destination: &adminMaxConnections,
+			Aliases:     []string{"amc"},
+		},
+		&cli.IntFlag{
+			Name:        "admin-max-requests",
+			Usage:       "maximum number of in-flight requests s3 admin server may handle",
+			EnvVars:     []string{"VGW_ADMIN_MAX_REQUESTS"},
+			Value:       100000,
+			Destination: &adminMaxRequests,
+			Aliases:     []string{"amr"},
 		},
 		&cli.StringFlag{
 			Name:        "admin-cert",
@@ -245,6 +369,13 @@ func initFlags() []cli.Flag {
 			EnvVars:     []string{"VGW_VIRTUAL_DOMAIN"},
 			Destination: &virtualDomain,
 			Aliases:     []string{"vd"},
+		},
+		&cli.BoolFlag{
+			Name:        "disable-acl",
+			Usage:       "disables gateway ACLs, by ignoring all ACL headers",
+			EnvVars:     []string{"VGW_DISABLE_ACL"},
+			Destination: &disableACLs,
+			Aliases:     []string{"noacl"},
 		},
 		&cli.StringFlag{
 			Name:        "access-log",
@@ -401,10 +532,28 @@ func initFlags() []cli.Flag {
 			Destination: &ldapGroupIdAtr,
 		},
 		&cli.StringFlag{
+			Name:        "iam-ldap-project-id-atr",
+			Usage:       "ldap server user project id attribute name",
+			EnvVars:     []string{"VGW_IAM_LDAP_PROJECT_ID_ATR"},
+			Destination: &ldapProjectIdAtr,
+		},
+		&cli.BoolFlag{
+			Name:        "iam-ldap-tls-skip-verify",
+			Usage:       "disable TLS certificate verification for LDAP connections (insecure, for self-signed certificates)",
+			EnvVars:     []string{"VGW_IAM_LDAP_TLS_SKIP_VERIFY"},
+			Destination: &ldapTLSSkipVerify,
+		},
+		&cli.StringFlag{
 			Name:        "iam-vault-endpoint-url",
 			Usage:       "vault server url",
 			EnvVars:     []string{"VGW_IAM_VAULT_ENDPOINT_URL"},
 			Destination: &vaultEndpointURL,
+		},
+		&cli.StringFlag{
+			Name:        "iam-vault-namespace",
+			Usage:       "vault server namespace",
+			EnvVars:     []string{"VGW_IAM_VAULT_NAMESPACE"},
+			Destination: &vaultNamespace,
 		},
 		&cli.StringFlag{
 			Name:        "iam-vault-secret-storage-path",
@@ -413,10 +562,22 @@ func initFlags() []cli.Flag {
 			Destination: &vaultSecretStoragePath,
 		},
 		&cli.StringFlag{
+			Name:        "iam-vault-secret-storage-namespace",
+			Usage:       "vault server secret storage namespace",
+			EnvVars:     []string{"VGW_IAM_VAULT_SECRET_STORAGE_NAMESPACE"},
+			Destination: &vaultSecretStorageNamespace,
+		},
+		&cli.StringFlag{
 			Name:        "iam-vault-auth-method",
 			Usage:       "vault server auth method",
 			EnvVars:     []string{"VGW_IAM_VAULT_AUTH_METHOD"},
 			Destination: &vaultAuthMethod,
+		},
+		&cli.StringFlag{
+			Name:        "iam-vault-auth-namespace",
+			Usage:       "vault server auth namespace",
+			EnvVars:     []string{"VGW_IAM_VAULT_AUTH_NAMESPACE"},
+			Destination: &vaultAuthNamespace,
 		},
 		&cli.StringFlag{
 			Name:        "iam-vault-mount-path",
@@ -537,6 +698,12 @@ func initFlags() []cli.Flag {
 			EnvVars:     []string{"VGW_READ_ONLY"},
 			Destination: &readonly,
 		},
+		&cli.BoolFlag{
+			Name:        "disable-strict-bucket-names",
+			Usage:       "allow relaxed bucket naming (disables strict validation checks)",
+			EnvVars:     []string{"VGW_DISABLE_STRICT_BUCKET_NAMES"},
+			Destination: &disableStrictBucketNames,
+		},
 		&cli.StringFlag{
 			Name:        "metrics-service-name",
 			Usage:       "service name tag for metrics, hostname if blank",
@@ -596,6 +763,75 @@ func runGateway(ctx context.Context, be backend.Backend) error {
 		return fmt.Errorf("root user access and secret key must be provided")
 	}
 
+	err := validateWebUIPathPrefix("--webui-path-prefix", webuiPathPrefix)
+	if err != nil {
+		return err
+	}
+
+	if maxConnections < 1 {
+		return fmt.Errorf("max-connections must be positive")
+	}
+	if maxRequests < 1 {
+		return fmt.Errorf("max-requests must be positive")
+	}
+	if maxRequests > maxConnections {
+		log.Printf("WARNING: max-requests (%d) exceeds max-connections (%d) which could allow for gateway to panic before throttling requests",
+			maxRequests, maxConnections)
+	}
+
+	// Ensure we have at least one port specified
+	if len(ports) == 0 {
+		return fmt.Errorf("no ports specified")
+	}
+
+	// WebUI runs in a browser and typically talks to the gateway/admin APIs cross-origin
+	// (different port). If no bucket CORS configuration exists, those API responses need
+	// a default Access-Control-Allow-Origin to be usable from the WebUI.
+	if len(webuiPorts) > 0 && strings.TrimSpace(corsAllowOrigin) == "" {
+		// A single Access-Control-Allow-Origin value cannot cover multiple specific
+		// origins. Default to '*' for usability and print a warning so operators can
+		// lock it down explicitly.
+		corsAllowOrigin = "*"
+		webuiScheme := "http"
+		if !webuiNoTLS && (strings.TrimSpace(webuiCertFile) != "" || strings.TrimSpace(certFile) != "") {
+			webuiScheme = "https"
+		}
+
+		// Suggest a more secure explicit origin based on the actual WebUI listening interfaces.
+		// (Browsers require an exact origin match; this is typically one chosen hostname/IP.)
+		var suggestion string
+		var allOrigins []string
+		for _, addr := range webuiPorts {
+			ips, ipsErr := getMatchingIPs(addr)
+			_, webPrt, prtErr := net.SplitHostPort(addr)
+			if ipsErr == nil && prtErr == nil && len(ips) > 0 {
+				for _, ip := range ips {
+					allOrigins = append(allOrigins, fmt.Sprintf("%s://%s:%s", webuiScheme, ip, webPrt))
+				}
+			}
+		}
+		if len(allOrigins) > 0 {
+			suggestion = fmt.Sprintf("consider setting it to one of: %s (or your public hostname)", strings.Join(allOrigins, ", "))
+		} else {
+			suggestion = fmt.Sprintf("consider setting it to %s://<host>:<port>", webuiScheme)
+		}
+
+		fmt.Fprintf(os.Stderr, "WARNING: --webui is enabled but --cors-allow-origin is not set; defaulting to '*'; %s\n", suggestion)
+	}
+
+	// Validate port conflicts across s3 api, admin, and webui ports
+	err = validatePortConflicts(ports, admPorts, webuiPorts)
+	if err != nil {
+		return err
+	}
+
+	err = validateWebUIPathPrefix("--webui-s3-prefix", webuiS3Prefix)
+	if err != nil {
+		return err
+	}
+
+	utils.SetBucketNameValidationStrict(!disableStrictBucketNames)
+
 	if pprof != "" {
 		// listen on specified port for pprof debug
 		// point browser to http://<ip:port>/debug/pprof/
@@ -604,16 +840,12 @@ func runGateway(ctx context.Context, be backend.Backend) error {
 		}()
 	}
 
-	app := fiber.New(fiber.Config{
-		AppName:               "versitygw",
-		ServerHeader:          "VERSITYGW",
-		StreamRequestBody:     true,
-		DisableKeepalive:      !keepAlive,
-		Network:               fiber.NetworkTCP,
-		DisableStartupMessage: true,
-	})
-
-	var opts []s3api.Option
+	opts := []s3api.Option{
+		s3api.WithConcurrencyLimiter(maxConnections, maxRequests),
+	}
+	if corsAllowOrigin != "" {
+		opts = append(opts, s3api.WithCORSAllowOrigin(corsAllowOrigin))
+	}
 
 	if certFile != "" || keyFile != "" {
 		if certFile == "" {
@@ -623,13 +855,14 @@ func runGateway(ctx context.Context, be backend.Backend) error {
 			return fmt.Errorf("TLS cert specified without key file")
 		}
 
-		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+		cs := utils.NewCertStorage()
+		err := cs.SetCertificate(certFile, keyFile)
 		if err != nil {
 			return fmt.Errorf("tls: load certs: %v", err)
 		}
-		opts = append(opts, s3api.WithTLS(cert))
+		opts = append(opts, s3api.WithTLS(cs))
 	}
-	if admPort == "" {
+	if len(admPorts) == 0 {
 		opts = append(opts, s3api.WithAdminServer())
 	}
 	if quiet {
@@ -644,11 +877,15 @@ func runGateway(ctx context.Context, be backend.Backend) error {
 	if virtualDomain != "" {
 		opts = append(opts, s3api.WithHostStyle(virtualDomain))
 	}
-
+	if keepAlive {
+		opts = append(opts, s3api.WithKeepAlive())
+	}
+	if disableACLs {
+		opts = append(opts, s3api.WithDisableACL())
+	}
 	if debug {
 		debuglogger.SetDebugEnabled()
 	}
-
 	if iamDebug {
 		debuglogger.SetIAMDebugEnabled()
 	}
@@ -659,41 +896,46 @@ func runGateway(ctx context.Context, be backend.Backend) error {
 			Secret: rootUserSecret,
 			Role:   auth.RoleAdmin,
 		},
-		Dir:                    iamDir,
-		LDAPServerURL:          ldapURL,
-		LDAPBindDN:             ldapBindDN,
-		LDAPPassword:           ldapPassword,
-		LDAPQueryBase:          ldapQueryBase,
-		LDAPObjClasses:         ldapObjClasses,
-		LDAPAccessAtr:          ldapAccessAtr,
-		LDAPSecretAtr:          ldapSecAtr,
-		LDAPRoleAtr:            ldapRoleAtr,
-		LDAPUserIdAtr:          ldapUserIdAtr,
-		LDAPGroupIdAtr:         ldapGroupIdAtr,
-		VaultEndpointURL:       vaultEndpointURL,
-		VaultSecretStoragePath: vaultSecretStoragePath,
-		VaultAuthMethod:        vaultAuthMethod,
-		VaultMountPath:         vaultMountPath,
-		VaultRootToken:         vaultRootToken,
-		VaultRoleId:            vaultRoleId,
-		VaultRoleSecret:        vaultRoleSecret,
-		VaultServerCert:        vaultServerCert,
-		VaultClientCert:        vaultClientCert,
-		VaultClientCertKey:     vaultClientCertKey,
-		S3Access:               s3IamAccess,
-		S3Secret:               s3IamSecret,
-		S3Region:               s3IamRegion,
-		S3Bucket:               s3IamBucket,
-		S3Endpoint:             s3IamEndpoint,
-		S3DisableSSlVerfiy:     s3IamSslNoVerify,
-		CacheDisable:           iamCacheDisable,
-		CacheTTL:               iamCacheTTL,
-		CachePrune:             iamCachePrune,
-		IpaHost:                ipaHost,
-		IpaVaultName:           ipaVaultName,
-		IpaUser:                ipaUser,
-		IpaPassword:            ipaPassword,
-		IpaInsecure:            ipaInsecure,
+		Dir:                         iamDir,
+		LDAPServerURL:               ldapURL,
+		LDAPBindDN:                  ldapBindDN,
+		LDAPPassword:                ldapPassword,
+		LDAPQueryBase:               ldapQueryBase,
+		LDAPObjClasses:              ldapObjClasses,
+		LDAPAccessAtr:               ldapAccessAtr,
+		LDAPSecretAtr:               ldapSecAtr,
+		LDAPRoleAtr:                 ldapRoleAtr,
+		LDAPUserIdAtr:               ldapUserIdAtr,
+		LDAPGroupIdAtr:              ldapGroupIdAtr,
+		LDAPProjectIdAtr:            ldapProjectIdAtr,
+		LDAPTLSSkipVerify:           ldapTLSSkipVerify,
+		VaultEndpointURL:            vaultEndpointURL,
+		VaultNamespace:              vaultNamespace,
+		VaultSecretStoragePath:      vaultSecretStoragePath,
+		VaultSecretStorageNamespace: vaultSecretStorageNamespace,
+		VaultAuthMethod:             vaultAuthMethod,
+		VaultAuthNamespace:          vaultAuthNamespace,
+		VaultMountPath:              vaultMountPath,
+		VaultRootToken:              vaultRootToken,
+		VaultRoleId:                 vaultRoleId,
+		VaultRoleSecret:             vaultRoleSecret,
+		VaultServerCert:             vaultServerCert,
+		VaultClientCert:             vaultClientCert,
+		VaultClientCertKey:          vaultClientCertKey,
+		S3Access:                    s3IamAccess,
+		S3Secret:                    s3IamSecret,
+		S3Region:                    s3IamRegion,
+		S3Bucket:                    s3IamBucket,
+		S3Endpoint:                  s3IamEndpoint,
+		S3DisableSSlVerfiy:          s3IamSslNoVerify,
+		CacheDisable:                iamCacheDisable,
+		CacheTTL:                    iamCacheTTL,
+		CachePrune:                  iamCachePrune,
+		IpaHost:                     ipaHost,
+		IpaVaultName:                ipaVaultName,
+		IpaUser:                     ipaUser,
+		IpaPassword:                 ipaPassword,
+		IpaInsecure:                 ipaInsecure,
 	})
 	if err != nil {
 		return fmt.Errorf("setup iam: %w", err)
@@ -733,25 +975,88 @@ func runGateway(ctx context.Context, be backend.Backend) error {
 		return fmt.Errorf("init bucket event notifications: %w", err)
 	}
 
-	srv, err := s3api.New(app, be, middlewares.RootUserConfig{
+	if webuiS3Prefix != "" {
+		s3SSLEnabled := certFile != ""
+		s3AdmSSLEnabled := s3SSLEnabled
+		if len(admPorts) > 0 {
+			s3AdmSSLEnabled = admCertFile != ""
+		}
+
+		var s3WebGateways []string
+		if len(webuiGateways) > 0 {
+			validGateways, err := validateGatewayURLs(webuiGateways, "webui gateway")
+			if err != nil {
+				return err
+			}
+			s3WebGateways = validGateways
+		} else {
+			for _, p := range ports {
+				urls, err := buildServiceURLs(p, s3SSLEnabled)
+				if err != nil {
+					return fmt.Errorf("webui-s3-prefix: build gateway URLs: %w", err)
+				}
+				s3WebGateways = append(s3WebGateways, urls...)
+			}
+			sortGatewayURLs(s3WebGateways)
+		}
+
+		s3WebAdminGateways := s3WebGateways
+		if len(webuiAdminGateways) > 0 {
+			validAdminGateways, err := validateGatewayURLs(webuiAdminGateways, "webui admin gateway")
+			if err != nil {
+				return err
+			}
+			s3WebAdminGateways = validAdminGateways
+		} else if len(admPorts) > 0 {
+			s3WebAdminGateways = nil
+			for _, admPort := range admPorts {
+				urls, err := buildServiceURLs(admPort, s3AdmSSLEnabled)
+				if err != nil {
+					return fmt.Errorf("webui-s3-prefix: build admin gateway URLs: %w", err)
+				}
+				s3WebAdminGateways = append(s3WebAdminGateways, urls...)
+			}
+			sortGatewayURLs(s3WebAdminGateways)
+		}
+
+		opts = append(opts, s3api.WithWebUI(webuiS3Prefix, &webui.ServerConfig{
+			Gateways:      s3WebGateways,
+			AdminGateways: s3WebAdminGateways,
+			Region:        region,
+		}))
+	}
+
+	srv, err := s3api.New(be, middlewares.RootUserConfig{
 		Access: rootUserAccess,
 		Secret: rootUserSecret,
-	}, port, region, iam, loggers.S3Logger, loggers.AdminLogger, evSender, metricsManager, opts...)
+	}, region, iam, loggers.S3Logger, loggers.AdminLogger, evSender, metricsManager, opts...)
 	if err != nil {
 		return fmt.Errorf("init gateway: %v", err)
 	}
 
 	var admSrv *s3api.S3AdminServer
 
-	if admPort != "" {
-		admApp := fiber.New(fiber.Config{
-			AppName:               "versitygw",
-			ServerHeader:          "VERSITYGW",
-			Network:               fiber.NetworkTCP,
-			DisableStartupMessage: true,
-		})
-
+	if len(admPorts) > 0 {
 		var opts []s3api.AdminOpt
+
+		if adminMaxConnections < 1 {
+			return fmt.Errorf("admin-max-connections must be positive")
+		}
+		if adminMaxRequests < 1 {
+			return fmt.Errorf("admin-max-requests must be positive")
+		}
+		if adminMaxRequests > adminMaxConnections {
+			log.Printf("WARNING: admin-max-requests (%d) exceeds admin-max-connections (%d) which could allow for gateway to panic before throttling requests",
+				adminMaxRequests, adminMaxConnections)
+		}
+
+		opts = []s3api.AdminOpt{
+			s3api.WithAdminConcurrencyLimiter(adminMaxConnections, adminMaxRequests),
+		}
+
+		if corsAllowOrigin != "" {
+			opts = append(opts, s3api.WithAdminCORSAllowOrigin(corsAllowOrigin))
+		}
 
 		if admCertFile != "" || admKeyFile != "" {
 			if admCertFile == "" {
@@ -761,11 +1066,12 @@ func runGateway(ctx context.Context, be backend.Backend) error {
 				return fmt.Errorf("TLS cert specified without key file")
 			}
 
-			cert, err := tls.LoadX509KeyPair(admCertFile, admKeyFile)
+			cs := utils.NewCertStorage()
+			err = cs.SetCertificate(admCertFile, admKeyFile)
 			if err != nil {
 				return fmt.Errorf("tls: load certs: %v", err)
 			}
-			opts = append(opts, s3api.WithAdminSrvTLS(cert))
+			opts = append(opts, s3api.WithAdminSrvTLS(cs))
 		}
 		if quiet {
 			opts = append(opts, s3api.WithAdminQuiet())
@@ -774,17 +1080,141 @@ func runGateway(ctx context.Context, be backend.Backend) error {
 			opts = append(opts, s3api.WithAdminDebug())
 		}
 
-		admSrv = s3api.NewAdminServer(admApp, be, middlewares.RootUserConfig{Access: rootUserAccess, Secret: rootUserSecret}, admPort, region, iam, loggers.AdminLogger, opts...)
+		admSrv = s3api.NewAdminServer(be, middlewares.RootUserConfig{Access: rootUserAccess, Secret: rootUserSecret}, region, iam, loggers.AdminLogger, srv.Router.Ctrl, opts...)
+	}
+
+	var webSrv *webui.Server
+	webuiSSLEnabled := false
+	webTLSCert := ""
+	webTLSKey := ""
+	if len(webuiPorts) > 0 {
+		// Validate all webui addresses
+		for _, addr := range webuiPorts {
+			_, webPrt, err := net.SplitHostPort(addr)
+			if err != nil {
+				return fmt.Errorf("webui listen address must be in the form ':port' or 'host:port': %w", err)
+			}
+			webPortNum, err := strconv.Atoi(webPrt)
+			if err != nil {
+				return fmt.Errorf("webui port must be a number: %w", err)
+			}
+			if webPortNum < 0 || webPortNum > 65535 {
+				return fmt.Errorf("webui port must be between 0 and 65535")
+			}
+		}
+
+		var webOpts []webui.Option
+		if !webuiNoTLS {
+			// WebUI can either use explicitly provided TLS files or reuse the
+			// gateway's TLS files by default.
+			webTLSCert = webuiCertFile
+			webTLSKey = webuiKeyFile
+			if webTLSCert == "" && webTLSKey == "" {
+				webTLSCert = certFile
+				webTLSKey = keyFile
+			}
+			if webTLSCert != "" || webTLSKey != "" {
+				if webTLSCert == "" {
+					return fmt.Errorf("webui TLS key specified without cert file")
+				}
+				if webTLSKey == "" {
+					return fmt.Errorf("webui TLS cert specified without key file")
+				}
+				webuiSSLEnabled = true
+
+				cs := utils.NewCertStorage()
+				err := cs.SetCertificate(webTLSCert, webTLSKey)
+				if err != nil {
+					return fmt.Errorf("tls: load certs: %v", err)
+				}
+
+				webOpts = append(webOpts, webui.WithTLS(cs))
+			}
+		}
+
+		sslEnabled := certFile != ""
+		admSSLEnabled := sslEnabled
+		if len(admPorts) > 0 {
+			admSSLEnabled = admCertFile != ""
+		}
+
+		var gateways []string
+		if len(webuiGateways) > 0 {
+			// Use explicitly provided gateway URLs if specified
+			// Validate explicitly provided URLs
+			validGateways, err := validateGatewayURLs(webuiGateways, "webui gateway")
+			if err != nil {
+				return err
+			}
+			gateways = validGateways
+		} else {
+			// Auto-detect from configured ports
+			for _, p := range ports {
+				urls, err := buildServiceURLs(p, sslEnabled)
+				if err != nil {
+					return fmt.Errorf("webui: build gateway URLs: %w", err)
+				}
+				gateways = append(gateways, urls...)
+			}
+			// Sort so localhost/127.0.0.1 URLs appear last
+			sortGatewayURLs(gateways)
+		}
+
+		adminGateways := gateways
+		if len(webuiAdminGateways) > 0 {
+			// Validate explicitly provided admin gateway URLs
+			validAdminGateways, err := validateGatewayURLs(webuiAdminGateways, "webui admin gateway")
+			if err != nil {
+				return err
+			}
+			adminGateways = validAdminGateways
+		} else if len(admPorts) > 0 {
+			// Auto-detect from configured admin ports
+			adminGateways = nil
+			for _, admPort := range admPorts {
+				urls, err := buildServiceURLs(admPort, admSSLEnabled)
+				if err != nil {
+					return fmt.Errorf("webui: build admin gateway URLs: %w", err)
+				}
+				adminGateways = append(adminGateways, urls...)
+			}
+			// Sort so localhost/127.0.0.1 URLs appear last
+			sortGatewayURLs(adminGateways)
+		}
+
+		if quiet {
+			webOpts = append(webOpts, webui.WithQuiet())
+		}
+		if webuiPathPrefix != "" {
+			webOpts = append(webOpts, webui.WithPathPrefix(webuiPathPrefix))
+		}
+
+		webSrv = webui.NewServer(&webui.ServerConfig{
+			Gateways:      gateways,
+			AdminGateways: adminGateways,
+			Region:        region,
+		}, webOpts...)
 	}
 
 	if !quiet {
-		printBanner(port, admPort, certFile != "", admCertFile != "")
+		printBanner(ports, admPorts, certFile != "" || keyFile != "", admCertFile != "" || admKeyFile != "", webuiPorts, webuiSSLEnabled, webuiPathPrefix, webuiS3Prefix)
 	}
 
-	c := make(chan error, 2)
-	go func() { c <- srv.Serve() }()
-	if admPort != "" {
-		go func() { c <- admSrv.Serve() }()
+	servers := 1
+	if len(admPorts) > 0 {
+		servers++
+	}
+	if len(webuiPorts) > 0 {
+		servers++
+	}
+
+	c := make(chan error, servers)
+	go func() { c <- srv.ServeMultiPort(ports) }()
+	if len(admPorts) > 0 {
+		go func() { c <- admSrv.ServeMultiPort(admPorts) }()
+	}
+	if len(webuiPorts) > 0 {
+		go func() { c <- webSrv.ServeMultiPort(webuiPorts) }()
 	}
 
 	// for/select blocks until shutdown
@@ -810,35 +1240,71 @@ Loop:
 					break Loop
 				}
 			}
+			if certFile != "" && keyFile != "" {
+				err = srv.CertStorage.SetCertificate(certFile, keyFile)
+				if err != nil {
+					debuglogger.InternalError(fmt.Errorf("srv cert reload failed: %w", err))
+				} else {
+					fmt.Printf("srv cert reloaded (cert: %s, key: %s)\n", certFile, keyFile)
+				}
+			}
+			if len(admPorts) > 0 && admCertFile != "" && admKeyFile != "" {
+				err = admSrv.CertStorage.SetCertificate(admCertFile, admKeyFile)
+				if err != nil {
+					debuglogger.InternalError(fmt.Errorf("admSrv cert reload failed: %w", err))
+				} else {
+					fmt.Printf("admSrv cert reloaded (cert: %s, key: %s)\n", admCertFile, admKeyFile)
+				}
+			}
+			if len(webuiPorts) > 0 && webTLSCert != "" && webTLSKey != "" {
+				err := webSrv.CertStorage.SetCertificate(webTLSCert, webTLSKey)
+				if err != nil {
+					debuglogger.InternalError(fmt.Errorf("webSrv cert reload failed: %w", err))
+				} else {
+					fmt.Printf("webSrv cert reloaded (cert: %s, key: %s)\n", webTLSCert, webTLSKey)
+				}
+			}
 		}
 	}
 	saveErr := err
+
+	// first shut down the s3api and admin servers
+	// as they have dependecy from other modules
+	err = srv.ShutDown()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "shutdown api server: %v\n", err)
+	}
+
+	if admSrv != nil {
+		err := admSrv.Shutdown()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "shutdown admin server: %v\n", err)
+		}
+	}
+
+	if webSrv != nil {
+		err := webSrv.Shutdown()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "shutdown webui server: %v\n", err)
+		}
+	}
 
 	be.Shutdown()
 
 	err = iam.Shutdown()
 	if err != nil {
-		if saveErr == nil {
-			saveErr = err
-		}
 		fmt.Fprintf(os.Stderr, "shutdown iam: %v\n", err)
 	}
 
 	if loggers.S3Logger != nil {
 		err := loggers.S3Logger.Shutdown()
 		if err != nil {
-			if saveErr == nil {
-				saveErr = err
-			}
 			fmt.Fprintf(os.Stderr, "shutdown s3 logger: %v\n", err)
 		}
 	}
 	if loggers.AdminLogger != nil {
 		err := loggers.AdminLogger.Shutdown()
 		if err != nil {
-			if saveErr == nil {
-				saveErr = err
-			}
 			fmt.Fprintf(os.Stderr, "shutdown admin logger: %v\n", err)
 		}
 	}
@@ -846,9 +1312,6 @@ Loop:
 	if evSender != nil {
 		err := evSender.Close()
 		if err != nil {
-			if saveErr == nil {
-				saveErr = err
-			}
 			fmt.Fprintf(os.Stderr, "close event sender: %v\n", err)
 		}
 	}
@@ -860,19 +1323,78 @@ Loop:
 	return saveErr
 }
 
-func printBanner(port, admPort string, ssl, admSsl bool) {
-	interfaces, err := getMatchingIPs(port)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to match local IP addresses: %v\n", err)
+func printBanner(ports []string, admPorts []string, ssl, admSsl bool, webuiAddrs []string, webuiSsl bool, webuiPathPrefix string, webuiS3Prefix string) {
+	if len(ports) == 0 {
+		fmt.Fprintf(os.Stderr, "No ports specified\n")
 		return
 	}
 
-	var admInterfaces []string
-	if admPort != "" {
-		admInterfaces, err = getMatchingIPs(admPort)
+	// Collect all interfaces for all ports
+	var allInterfaces []string
+	var allPorts []string
+	interfaceMap := make(map[string]bool) // deduplicate
+
+	for _, portSpec := range ports {
+		if utils.IsUnixSocketPath(portSpec) {
+			allPorts = append(allPorts, portSpec)
+			if !interfaceMap[portSpec] {
+				interfaceMap[portSpec] = true
+				allInterfaces = append(allInterfaces, portSpec)
+			}
+			continue
+		}
+		interfaces, err := getMatchingIPs(portSpec)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to match admin port local IP addresses: %v\n", err)
-			return
+			fmt.Fprintf(os.Stderr, "Failed to match local IP addresses for %s: %v\n", portSpec, err)
+			continue
+		}
+		_, prt, err := net.SplitHostPort(portSpec)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to parse port %s: %v\n", portSpec, err)
+			continue
+		}
+		allPorts = append(allPorts, prt)
+		for _, ip := range interfaces {
+			key := net.JoinHostPort(ip, prt)
+			if !interfaceMap[key] {
+				interfaceMap[key] = true
+				allInterfaces = append(allInterfaces, key)
+			}
+		}
+	}
+
+	if len(allInterfaces) == 0 {
+		fmt.Fprintf(os.Stderr, "Failed to resolve any listening addresses\n")
+		return
+	}
+
+	// Collect all admin interfaces for all admin ports
+	var allAdmInterfaces []string
+	admInterfaceMap := make(map[string]bool)
+	for _, admPort := range admPorts {
+		if utils.IsUnixSocketPath(admPort) {
+			if !admInterfaceMap[admPort] {
+				admInterfaceMap[admPort] = true
+				allAdmInterfaces = append(allAdmInterfaces, admPort)
+			}
+			continue
+		}
+		interfaces, err := getMatchingIPs(admPort)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to match admin port local IP addresses for %s: %v\n", admPort, err)
+			continue
+		}
+		_, prt, err := net.SplitHostPort(admPort)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to parse admin port %s: %v\n", admPort, err)
+			continue
+		}
+		for _, ip := range interfaces {
+			key := net.JoinHostPort(ip, prt)
+			if !admInterfaceMap[key] {
+				admInterfaceMap[key] = true
+				allAdmInterfaces = append(allAdmInterfaces, key)
+			}
 		}
 	}
 
@@ -880,25 +1402,43 @@ func printBanner(port, admPort string, ssl, admSsl bool) {
 	version := fmt.Sprintf("Version %v, Build %v", Version, Build)
 	urls := []string{}
 
-	hst, prt, err := net.SplitHostPort(port)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to parse port: %v\n", err)
-		return
-	}
-
-	for _, ip := range interfaces {
-		url := fmt.Sprintf("http://%s:%s", ip, prt)
+	// Build URLs for all listening addresses
+	for _, addrPort := range allInterfaces {
+		if utils.IsUnixSocketPath(addrPort) {
+			urls = append(urls, "unix:"+addrPort)
+			continue
+		}
+		ip, prt, err := net.SplitHostPort(addrPort)
+		if err != nil {
+			// Shouldn't happen as we constructed these properly, but handle it
+			continue
+		}
+		// Rebuild the host:port using JoinHostPort to ensure IPv6 addresses have brackets
+		hostPort := net.JoinHostPort(ip, prt)
+		url := fmt.Sprintf("http://%s", hostPort)
 		if ssl {
-			url = fmt.Sprintf("https://%s:%s", ip, prt)
+			url = fmt.Sprintf("https://%s", hostPort)
 		}
 		urls = append(urls, url)
 	}
 
-	if hst == "" {
-		hst = "0.0.0.0"
+	// Determine bound host description
+	var boundHost string
+	if len(ports) == 1 {
+		if utils.IsUnixSocketPath(ports[0]) {
+			boundHost = fmt.Sprintf("(unix socket: %s)", ports[0])
+		} else {
+			hst, prt, _ := net.SplitHostPort(ports[0])
+			if hst == "" {
+				hst = "0.0.0.0"
+			}
+			boundHost = fmt.Sprintf("(bound on host %s and port %s)", hst, prt)
+		}
+	} else {
+		// Multiple ports
+		portList := strings.Join(allPorts, ", ")
+		boundHost = fmt.Sprintf("(bound on ports: %s)", portList)
 	}
-
-	boundHost := fmt.Sprintf("(bound on host %s and port %s)", hst, prt)
 
 	lines := []string{
 		centerText(title),
@@ -907,7 +1447,7 @@ func printBanner(port, admPort string, ssl, admSsl bool) {
 		centerText(""),
 	}
 
-	if len(admInterfaces) > 0 {
+	if len(allAdmInterfaces) > 0 {
 		lines = append(lines,
 			leftText("S3 service listening on:"),
 		)
@@ -921,24 +1461,105 @@ func printBanner(port, admPort string, ssl, admSsl bool) {
 		lines = append(lines, leftText("  "+url))
 	}
 
-	if len(admInterfaces) > 0 {
+	if len(allAdmInterfaces) > 0 {
 		lines = append(lines,
 			centerText(""),
 			leftText("Admin service listening on:"),
 		)
 
-		_, prt, err := net.SplitHostPort(admPort)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to parse port: %v\n", err)
-			return
-		}
-
-		for _, ip := range admInterfaces {
-			url := fmt.Sprintf("http://%s:%s", ip, prt)
+		for _, addrPort := range allAdmInterfaces {
+			if utils.IsUnixSocketPath(addrPort) {
+				lines = append(lines, leftText("  unix:"+addrPort))
+				continue
+			}
+			ip, prt, err := net.SplitHostPort(addrPort)
+			if err != nil {
+				continue
+			}
+			hostPort := net.JoinHostPort(ip, prt)
+			url := fmt.Sprintf("http://%s", hostPort)
 			if admSsl {
-				url = fmt.Sprintf("https://%s:%s", ip, prt)
+				url = fmt.Sprintf("https://%s", hostPort)
 			}
 			lines = append(lines, leftText("  "+url))
+		}
+	}
+
+	// Collect all webui interfaces for all webui addresses
+	if len(webuiAddrs) > 0 {
+		var allWebInterfaces []string
+		webInterfaceMap := make(map[string]bool)
+
+		for _, webuiAddr := range webuiAddrs {
+			if strings.TrimSpace(webuiAddr) == "" {
+				continue
+			}
+			if utils.IsUnixSocketPath(webuiAddr) {
+				if !webInterfaceMap[webuiAddr] {
+					webInterfaceMap[webuiAddr] = true
+					allWebInterfaces = append(allWebInterfaces, webuiAddr)
+				}
+				continue
+			}
+			webInterfaces, err := getMatchingIPs(webuiAddr)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Failed to match webui port local IP addresses for %s: %v\n", webuiAddr, err)
+				continue
+			}
+			_, webPrt, err := net.SplitHostPort(webuiAddr)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Failed to parse webui port %s: %v\n", webuiAddr, err)
+				continue
+			}
+			for _, ip := range webInterfaces {
+				key := net.JoinHostPort(ip, webPrt)
+				if !webInterfaceMap[key] {
+					webInterfaceMap[key] = true
+					allWebInterfaces = append(allWebInterfaces, key)
+				}
+			}
+		}
+
+		if len(allWebInterfaces) > 0 {
+			lines = append(lines,
+				centerText(""),
+				leftText("WebUI listening on:"),
+			)
+			for _, addrPort := range allWebInterfaces {
+				if utils.IsUnixSocketPath(addrPort) {
+					lines = append(lines, leftText("  unix:"+addrPort))
+					continue
+				}
+				ip, prt, err := net.SplitHostPort(addrPort)
+				if err != nil {
+					continue
+				}
+				hostPort := net.JoinHostPort(ip, prt)
+				url := fmt.Sprintf("http://%s", hostPort)
+				if webuiSsl {
+					url = fmt.Sprintf("https://%s", hostPort)
+				}
+				lines = append(lines, leftText("  "+url+webuiPathPrefix))
+			}
+		}
+	}
+
+	if webuiS3Prefix != "" {
+		lines = append(lines,
+			centerText(""),
+			leftText("WebUI embedded on S3 service at:"),
+		)
+		for _, addrPort := range allInterfaces {
+			ip, prt, err := net.SplitHostPort(addrPort)
+			if err != nil {
+				continue
+			}
+			hostPort := net.JoinHostPort(ip, prt)
+			url := fmt.Sprintf("http://%s", hostPort)
+			if ssl {
+				url = fmt.Sprintf("https://%s", hostPort)
+			}
+			lines = append(lines, leftText("  "+url+webuiS3Prefix))
 		}
 	}
 
@@ -954,67 +1575,328 @@ func printBanner(port, admPort string, ssl, admSsl bool) {
 	fmt.Println("└" + strings.Repeat("─", columnWidth-2) + "┘")
 }
 
-// getMatchingIPs returns all IP addresses for local system interfaces that
-// match the input address specification.
+// getMatchingIPs returns all IP addresses that the server will listen on
+// for the given address specification. For hostnames, it resolves to all
+// IP addresses (e.g., localhost -> 127.0.0.1 and ::1).
 func getMatchingIPs(spec string) ([]string, error) {
-	// Split the input spec into IP and port
-	host, _, err := net.SplitHostPort(spec)
+	if utils.IsUnixSocketPath(spec) {
+		// Unix socket paths have no IP addresses; return the path itself as an identifier.
+		return []string{spec}, nil
+	}
+
+	ips, err := utils.ResolveHostnameIPs(spec)
 	if err != nil {
-		return nil, fmt.Errorf("parse address/port: %v", err)
+		return nil, fmt.Errorf("resolve hostname: %v", err)
 	}
 
-	// Handle cases where IP is omitted (e.g., ":1234")
-	if host == "" {
-		host = "0.0.0.0"
+	// If empty host (e.g., ":8080"), enumerate all local interfaces
+	if len(ips) == 1 && ips[0] == "" {
+		return getAllLocalIPs()
 	}
 
-	ipaddr, err := net.ResolveIPAddr("ip", host)
-	if err != nil {
-		return nil, err
+	// Filter out link-local addresses
+	var result []string
+	for _, ip := range ips {
+		parsedIP := net.ParseIP(ip)
+		if parsedIP == nil {
+			continue
+		}
+		if parsedIP.IsLinkLocalUnicast() || parsedIP.IsLinkLocalMulticast() || parsedIP.IsInterfaceLocalMulticast() {
+			continue
+		}
+		result = append(result, ip)
 	}
 
-	parsedInputIP := ipaddr.IP
+	return result, nil
+}
 
+// getAllLocalIPs returns all non-link-local IP addresses from local interfaces
+func getAllLocalIPs() ([]string, error) {
 	var result []string
 
-	// Get all network interfaces
 	interfaces, err := net.Interfaces()
 	if err != nil {
 		return nil, err
 	}
 
 	for _, iface := range interfaces {
-		// Get all addresses associated with the interface
 		addrs, err := iface.Addrs()
 		if err != nil {
-			return nil, err
+			continue
 		}
 
 		for _, addr := range addrs {
-			// Parse the address to get the IP part
 			ipAddr, _, err := net.ParseCIDR(addr.String())
 			if err != nil {
-				return nil, err
-			}
-
-			if ipAddr.IsLinkLocalUnicast() {
-				continue
-			}
-			if ipAddr.IsInterfaceLocalMulticast() {
-				continue
-			}
-			if ipAddr.IsLinkLocalMulticast() {
 				continue
 			}
 
-			// Check if the IP matches the input specification
-			if parsedInputIP.Equal(net.IPv4(0, 0, 0, 0)) || parsedInputIP.Equal(ipAddr) {
-				result = append(result, ipAddr.String())
+			if ipAddr.IsLinkLocalUnicast() || ipAddr.IsInterfaceLocalMulticast() || ipAddr.IsLinkLocalMulticast() {
+				continue
 			}
+
+			result = append(result, ipAddr.String())
 		}
 	}
 
 	return result, nil
+}
+
+func buildServiceURLs(spec string, ssl bool) ([]string, error) {
+	if utils.IsUnixSocketPath(spec) {
+		// UNIX socket paths cannot be expressed as HTTP(S) URLs for WebUI gateways;
+		// skip them silently.
+		return nil, nil
+	}
+
+	interfaces, err := getMatchingIPs(spec)
+	if err != nil {
+		return nil, err
+	}
+	_, prt, err := net.SplitHostPort(spec)
+	if err != nil {
+		return nil, fmt.Errorf("parse address/port: %w", err)
+	}
+	if len(interfaces) == 0 {
+		interfaces = []string{"localhost"}
+	}
+
+	scheme := "http"
+	if ssl {
+		scheme = "https"
+	}
+	urls := make([]string, 0, len(interfaces))
+	for _, ip := range interfaces {
+		urls = append(urls, fmt.Sprintf("%s://%s", scheme, net.JoinHostPort(ip, prt)))
+	}
+	return urls, nil
+}
+
+// isLocalhost checks if a URL contains a localhost address
+func isLocalhost(url string) bool {
+	return strings.Contains(url, "localhost") ||
+		strings.Contains(url, "127.0.0.1") ||
+		strings.Contains(url, "[::1]")
+}
+
+// validateGatewayURLs validates a list of gateway URLs and returns only valid ones.
+// It prints warnings for invalid URLs and returns an error if the input list is non-empty
+// but contains no valid URLs after filtering.
+func validateGatewayURLs(urls []string, urlType string) ([]string, error) {
+	if len(urls) == 0 {
+		return urls, nil
+	}
+
+	var validURLs []string
+	for _, urlStr := range urls {
+		// Skip empty strings
+		if strings.TrimSpace(urlStr) == "" {
+			continue
+		}
+
+		parsedURL, err := url.Parse(urlStr)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "WARNING: invalid %s URL %q: %v\n", urlType, urlStr, err)
+			continue
+		}
+
+		// Ensure the URL has a scheme (http or https)
+		if parsedURL.Scheme == "" {
+			fmt.Fprintf(os.Stderr, "WARNING: invalid %s URL %q: missing scheme (must be http:// or https://)\n", urlType, urlStr)
+			continue
+		}
+
+		if parsedURL.Scheme != "http" && parsedURL.Scheme != "https" {
+			fmt.Fprintf(os.Stderr, "WARNING: invalid %s URL %q: unsupported scheme %q (must be http or https)\n", urlType, urlStr, parsedURL.Scheme)
+			continue
+		}
+
+		// Ensure the URL has a host
+		if parsedURL.Host == "" {
+			fmt.Fprintf(os.Stderr, "WARNING: invalid %s URL %q: missing host\n", urlType, urlStr)
+			continue
+		}
+
+		validURLs = append(validURLs, urlStr)
+	}
+
+	if len(validURLs) == 0 {
+		return nil, fmt.Errorf("%s URLs specified but none are valid", urlType)
+	}
+
+	return validURLs, nil
+}
+
+// validateWebUIPathPrefix validates webui path prefix.
+// Accepted format is a single path segment like "/ui".
+func validateWebUIPathPrefix(option, prefix string) error {
+	if prefix == "" {
+		return nil
+	}
+
+	if strings.TrimSpace(prefix) != prefix {
+		return fmt.Errorf("invalid %v %q: must not contain leading or trailing whitespace",
+			option, prefix)
+	}
+
+	if !strings.HasPrefix(prefix, "/") {
+		return fmt.Errorf("invalid %v %q: must start with '/' (example: '/ui')",
+			option, prefix)
+	}
+
+	if strings.HasSuffix(prefix, "/") {
+		return fmt.Errorf("invalid %v %q: must not end with '/'",
+			option, prefix)
+	}
+
+	if strings.Count(prefix, "/") > 1 {
+		return fmt.Errorf("invalid %v %q: only a single path segment is allowed (example: '/ui')",
+			option, prefix)
+	}
+
+	if strings.ContainsAny(prefix, "?#") {
+		return fmt.Errorf("invalid %v %q: query strings and fragments are not allowed",
+			option, prefix)
+	}
+
+	if strings.Contains(prefix, "\\") {
+		return fmt.Errorf("invalid %v %q: backslashes are not allowed",
+			option, prefix)
+	}
+
+	return nil
+}
+
+// sortGatewayURLs sorts a list of URLs so that localhost and 127.0.0.1 URLs appear last
+func sortGatewayURLs(urls []string) {
+	if len(urls) <= 1 {
+		return
+	}
+
+	// Partition URLs into two groups: non-localhost and localhost
+	var nonLocal []string
+	var local []string
+
+	for _, url := range urls {
+		if isLocalhost(url) {
+			local = append(local, url)
+		} else {
+			nonLocal = append(nonLocal, url)
+		}
+	}
+
+	// Rebuild the slice with non-localhost first, then localhost
+	copy(urls, nonLocal)
+	copy(urls[len(nonLocal):], local)
+}
+
+// validatePortConflicts checks for port conflicts across s3 api, admin, and webui ports.
+// A bare port spec (e.g., ":7071") binds to all interfaces and will conflict with any other
+// binding on the same port, whether it's ":7071" or "ip:7071".
+// However, two identical "ip:port" specs are allowed (will be caught by later errors).
+// UNIX socket paths (e.g., "/tmp/gw.sock") are checked for duplicate path conflicts only,
+// and do not conflict with TCP port specifications.
+// This is needed because net.Listen() does not return the address already in use
+// error for the bare port spec arguments.
+func validatePortConflicts(ports, admPorts, webuiPorts []string) error {
+	type portSpec struct {
+		spec     string
+		port     string
+		isBare   bool
+		isUnix   bool
+		portType string // "s3", "admin", or "webui"
+	}
+
+	var allSpecs []portSpec
+
+	// Collect all port specs
+	for _, p := range ports {
+		if utils.IsUnixSocketPath(p) {
+			allSpecs = append(allSpecs, portSpec{spec: p, port: p, isUnix: true, portType: "s3"})
+			continue
+		}
+		_, port, err := net.SplitHostPort(p)
+		if err != nil {
+			continue // will be caught by later validation
+		}
+		allSpecs = append(allSpecs, portSpec{
+			spec:     p,
+			port:     port,
+			isBare:   strings.HasPrefix(p, ":"),
+			portType: "s3",
+		})
+	}
+
+	for _, p := range admPorts {
+		if utils.IsUnixSocketPath(p) {
+			allSpecs = append(allSpecs, portSpec{spec: p, port: p, isUnix: true, portType: "admin"})
+			continue
+		}
+		_, port, err := net.SplitHostPort(p)
+		if err != nil {
+			continue // will be caught by later validation
+		}
+		allSpecs = append(allSpecs, portSpec{
+			spec:     p,
+			port:     port,
+			isBare:   strings.HasPrefix(p, ":"),
+			portType: "admin",
+		})
+	}
+
+	for _, p := range webuiPorts {
+		if utils.IsUnixSocketPath(p) {
+			allSpecs = append(allSpecs, portSpec{spec: p, port: p, isUnix: true, portType: "webui"})
+			continue
+		}
+		_, port, err := net.SplitHostPort(p)
+		if err != nil {
+			continue // will be caught by later validation
+		}
+		allSpecs = append(allSpecs, portSpec{
+			spec:     p,
+			port:     port,
+			isBare:   strings.HasPrefix(p, ":"),
+			portType: "webui",
+		})
+	}
+
+	// Check for conflicts
+	for i, spec1 := range allSpecs {
+		for j, spec2 := range allSpecs {
+			if i >= j {
+				continue // skip comparing with self and already compared pairs
+			}
+
+			// Unix sockets and TCP ports never conflict with each other;
+			// only check for duplicate socket paths.
+			if spec1.isUnix || spec2.isUnix {
+				if spec1.isUnix && spec2.isUnix && spec1.spec == spec2.spec {
+					return fmt.Errorf("duplicate unix socket path: --%s %s conflicts with --%s %s",
+						spec1.portType, spec1.spec, spec2.portType, spec2.spec)
+				}
+				continue
+			}
+
+			// If ports don't match, no conflict
+			if spec1.port != spec2.port {
+				continue
+			}
+
+			// If both are identical IP:port specs, allow (will be caught later)
+			if !spec1.isBare && !spec2.isBare && spec1.spec == spec2.spec {
+				continue
+			}
+
+			// If either is a bare port spec, it's a conflict with any other spec on the same port
+			if spec1.isBare || spec2.isBare {
+				return fmt.Errorf("port conflict: --%s %s conflicts with --%s %s (bare port specs bind to all interfaces)",
+					spec1.portType, spec1.spec, spec2.portType, spec2.spec)
+			}
+		}
+	}
+
+	return nil
 }
 
 const columnWidth = 70

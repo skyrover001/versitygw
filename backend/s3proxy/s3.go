@@ -47,15 +47,17 @@ type S3Proxy struct {
 
 	client *s3.Client
 
-	access          string
-	secret          string
-	endpoint        string
-	awsRegion       string
-	metaBucket      string
-	disableChecksum bool
-	sslSkipVerify   bool
-	usePathStyle    bool
-	debug           bool
+	access                    string
+	secret                    string
+	anonymousCredentials      bool
+	endpoint                  string
+	awsRegion                 string
+	metaBucket                string
+	disableChecksum           bool
+	disableDataIntegrityCheck bool
+	sslSkipVerify             bool
+	usePathStyle              bool
+	debug                     bool
 }
 
 var _ backend.Backend = &S3Proxy{}
@@ -68,17 +70,19 @@ func NewWithClient(ctx context.Context, client *s3.Client, metaBucket string) (*
 	return s, s.validate(ctx)
 }
 
-func New(ctx context.Context, access, secret, endpoint, region, metaBucket string, disableChecksum, sslSkipVerify, usePathStyle, debug bool) (*S3Proxy, error) {
+func New(ctx context.Context, access, secret, endpoint, region, metaBucket string, anonymousCredentials, disableChecksum, disableDataIntegrityCheck, sslSkipVerify, usePathStyle, debug bool) (*S3Proxy, error) {
 	s := &S3Proxy{
-		access:          access,
-		secret:          secret,
-		endpoint:        endpoint,
-		awsRegion:       region,
-		metaBucket:      metaBucket,
-		disableChecksum: disableChecksum,
-		sslSkipVerify:   sslSkipVerify,
-		usePathStyle:    usePathStyle,
-		debug:           debug,
+		access:                    access,
+		secret:                    secret,
+		anonymousCredentials:      anonymousCredentials,
+		endpoint:                  endpoint,
+		awsRegion:                 region,
+		metaBucket:                metaBucket,
+		disableChecksum:           disableChecksum,
+		disableDataIntegrityCheck: disableDataIntegrityCheck,
+		sslSkipVerify:             sslSkipVerify,
+		usePathStyle:              usePathStyle,
+		debug:                     debug,
 	}
 	client, err := s.getClientWithCtx(ctx)
 	if err != nil {
@@ -285,11 +289,14 @@ func (s *S3Proxy) GetBucketVersioning(ctx context.Context, bucket string) (s3res
 	out, err := s.client.GetBucketVersioning(ctx, &s3.GetBucketVersioningInput{
 		Bucket: &bucket,
 	})
+	if err != nil {
+		return s3response.GetBucketVersioningOutput{}, handleError(err)
+	}
 
 	return s3response.GetBucketVersioningOutput{
 		Status:    &out.Status,
 		MFADelete: &out.MFADelete,
-	}, handleError(err)
+	}, nil
 }
 
 func (s *S3Proxy) ListObjectVersions(ctx context.Context, input *s3.ListObjectVersionsInput) (s3response.ListVersionsResult, error) {
@@ -1093,6 +1100,9 @@ func (s *S3Proxy) GetObjectAttributes(ctx context.Context, input *s3.GetObjectAt
 	}
 
 	out, err := s.client.GetObjectAttributes(ctx, input)
+	if err != nil {
+		return s3response.GetObjectAttributesResponse{}, handleError(err)
+	}
 
 	parts := s3response.ObjectParts{}
 	objParts := out.ObjectParts
@@ -1125,7 +1135,7 @@ func (s *S3Proxy) GetObjectAttributes(ctx context.Context, input *s3.GetObjectAt
 		StorageClass: out.StorageClass,
 		ObjectParts:  &parts,
 		Checksum:     out.Checksum,
-	}, handleError(err)
+	}, nil
 }
 
 func (s *S3Proxy) CopyObject(ctx context.Context, input s3response.CopyObjectInput) (s3response.CopyObjectOutput, error) {
@@ -1445,7 +1455,7 @@ func (s *S3Proxy) PutBucketAcl(ctx context.Context, bucket string, data []byte) 
 	return handleError(s.putMetaBucketObj(ctx, bucket, data, metaPrefixAcl))
 }
 
-func (s *S3Proxy) PutObjectTagging(ctx context.Context, bucket, object string, tags map[string]string) error {
+func (s *S3Proxy) PutObjectTagging(ctx context.Context, bucket, object, versionId string, tags map[string]string) error {
 	if bucket == s.metaBucket {
 		return s3err.GetAPIError(s3err.ErrAccessDenied)
 	}
@@ -1460,20 +1470,22 @@ func (s *S3Proxy) PutObjectTagging(ctx context.Context, bucket, object string, t
 	}
 
 	_, err := s.client.PutObjectTagging(ctx, &s3.PutObjectTaggingInput{
-		Bucket:  &bucket,
-		Key:     &object,
-		Tagging: tagging,
+		Bucket:    &bucket,
+		Key:       &object,
+		VersionId: &versionId,
+		Tagging:   tagging,
 	})
 	return handleError(err)
 }
 
-func (s *S3Proxy) GetObjectTagging(ctx context.Context, bucket, object string) (map[string]string, error) {
+func (s *S3Proxy) GetObjectTagging(ctx context.Context, bucket, object, versionId string) (map[string]string, error) {
 	if bucket == s.metaBucket {
 		return nil, s3err.GetAPIError(s3err.ErrAccessDenied)
 	}
 	output, err := s.client.GetObjectTagging(ctx, &s3.GetObjectTaggingInput{
-		Bucket: &bucket,
-		Key:    &object,
+		Bucket:    &bucket,
+		Key:       &object,
+		VersionId: &versionId,
 	})
 	if err != nil {
 		return nil, handleError(err)
@@ -1487,13 +1499,14 @@ func (s *S3Proxy) GetObjectTagging(ctx context.Context, bucket, object string) (
 	return tags, nil
 }
 
-func (s *S3Proxy) DeleteObjectTagging(ctx context.Context, bucket, object string) error {
+func (s *S3Proxy) DeleteObjectTagging(ctx context.Context, bucket, object, versionId string) error {
 	if bucket == s.metaBucket {
 		return s3err.GetAPIError(s3err.ErrAccessDenied)
 	}
 	_, err := s.client.DeleteObjectTagging(ctx, &s3.DeleteObjectTaggingInput{
-		Bucket: &bucket,
-		Key:    &object,
+		Bucket:    &bucket,
+		Key:       &object,
+		VersionId: &versionId,
 	})
 	return handleError(err)
 }
@@ -1558,7 +1571,7 @@ func (s *S3Proxy) GetObjectLockConfiguration(ctx context.Context, bucket string)
 	return nil, s3err.GetAPIError(s3err.ErrObjectLockConfigurationNotFound)
 }
 
-func (s *S3Proxy) PutObjectRetention(ctx context.Context, bucket, object, versionId string, bypass bool, retention []byte) error {
+func (s *S3Proxy) PutObjectRetention(ctx context.Context, bucket, object, versionId string, retention []byte) error {
 	return s3err.GetAPIError(s3err.ErrNotImplemented)
 }
 

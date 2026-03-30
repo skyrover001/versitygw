@@ -25,7 +25,6 @@ create_bucket() {
     return 1
   fi
 
-  record_command "create-bucket" "client:$1"
   local exit_code=0
   local error
   if [[ $1 == 's3' ]]; then
@@ -36,16 +35,41 @@ create_bucket() {
     log 5 "s3cmd ${S3CMD_OPTS[*]} --no-check-certificate mb s3://$2"
     error=$(send_command s3cmd "${S3CMD_OPTS[@]}" --no-check-certificate mb s3://"$2" 2>&1) || exit_code=$?
   elif [[ $1 == "mc" ]]; then
-    error=$(send_command mc --insecure mb "$MC_ALIAS"/"$2" 2>&1) || exit_code=$?
+    error=$(send_command mc --insecure mb "$MC_ALIAS"/"$2" --region "$AWS_REGION" 2>&1) || exit_code=$?
+  else
+    error="invalid command type $1"
+    exit_code=1
+  fi
+  if [ $exit_code -ne 0 ]; then
+    printf "error creating bucket: %s\n" "$error" >&2
+    return $exit_code
+  fi
+  return 0
+}
+
+create_bucket_invalid_name() {
+  if [ $# -ne 1 ]; then
+    log 2 "create bucket w/invalid name missing command type"
+    return 1
+  fi
+  local exit_code=0
+  if [[ $1 == "aws" ]] || [[ $1 == 's3' ]]; then
+    bucket_create_error=$(aws --no-verify-ssl s3 mb "s3://" 2>&1) || exit_code=$?
+  elif [[ $1 == 's3api' ]]; then
+    bucket_create_error=$(aws --no-verify-ssl s3api create-bucket --bucket "s3://" 2>&1) || exit_code=$?
+  elif [[ $1 == 's3cmd' ]]; then
+    bucket_create_error=$(s3cmd "${S3CMD_OPTS[@]}" --no-check-certificate mb --region="$AWS_REGION" "s3://" 2>&1) || exit_code=$?
+  elif [[ $1 == 'mc' ]]; then
+    bucket_create_error=$(mc --insecure mb "$MC_ALIAS/." 2>&1) || exit_code=$?
   else
     log 2 "invalid command type $1"
     return 1
   fi
-  if [ $exit_code -ne 0 ]; then
-    log 2 "error creating bucket: $error"
+  if [ $exit_code -eq 0 ]; then
+    log 2 "error:  bucket should have not been created but was"
     return 1
   fi
-  return 0
+  echo "$bucket_create_error"
 }
 
 create_bucket_with_user() {
@@ -57,7 +81,7 @@ create_bucket_with_user() {
   if [[ $1 == "aws" ]] || [[ $1 == "s3api" ]]; then
     error=$(AWS_ACCESS_KEY_ID="$3" AWS_SECRET_ACCESS_KEY="$4" send_command aws --no-verify-ssl s3 mb s3://"$2" 2>&1) || exit_code=$?
   elif [[ $1 == "s3cmd" ]]; then
-    error=$(send_command s3cmd "${S3CMD_OPTS[@]}" --no-check-certificate mb --access_key="$3" --secret_key="$4" s3://"$2" 2>&1) || exit_code=$?
+    error=$(send_command s3cmd "${S3CMD_OPTS[@]}" --no-check-certificate mb --access_key="$3" --secret_key="$4" --region="$AWS_REGION" s3://"$2" 2>&1) || exit_code=$?
   elif [[ $1 == "mc" ]]; then
     error=$(send_command mc --insecure mb "$MC_ALIAS"/"$2" 2>&1) || exit_code=$?
   else
@@ -73,7 +97,6 @@ create_bucket_with_user() {
 
 create_bucket_object_lock_enabled() {
   log 6 "create_bucket_object_lock_enabled"
-  record_command "create-bucket" "client:s3api"
   if ! check_param_count "create_bucket_object_lock_enabled" "bucket" 1 $#; then
     return 1
   fi
@@ -121,6 +144,22 @@ create_bucket_rest_expect_success() {
   env_vars="BUCKET_NAME=$1 $2"
   if ! send_rest_command_expect_success "$env_vars" "./tests/rest_scripts/create_bucket.sh" "200"; then
     log 2 "error sending REST command and checking error"
+    return 1
+  fi
+  return 0
+}
+
+create_bucket_rest() {
+  if ! check_param_count "create_bucket_rest" "bucket name" 1 $#; then
+    return 1
+  fi
+  if ! result=$(COMMAND_LOG="$COMMAND_LOG" BUCKET_NAME="$BUCKET_ONE_NAME" OUTPUT_FILE="$TEST_FILE_FOLDER/result.txt" ./tests/rest_scripts/create_bucket.sh 2>&1); then
+    log 2 "error creating bucket: $result"
+    return 1
+  fi
+  if [ "$result" != "200" ]; then
+    bucket_create_error="$(cat "$TEST_FILE_FOLDER/result.txt")"
+    log 2 "expected '200', was '$result' ($bucket_create_error)"
     return 1
   fi
   return 0

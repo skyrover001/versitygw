@@ -14,6 +14,13 @@
 # specific language governing permissions and limitations
 # under the License.
 
+source ./tests/drivers/delete_object/delete_object_rest.sh
+source ./tests/drivers/get_object_lock_config/get_object_lock_config_rest.sh
+source ./tests/drivers/put_bucket_acl/put_bucket_acl_rest.sh
+source ./tests/drivers/file.sh
+source ./tests/util/util_multipart_abort.sh
+source ./tests/util/util_policy.sh
+source ./tests/util/util_retention.sh
 source ./tests/util/util_users.sh
 
 create_versitygw_acl_user_or_get_direct_user() {
@@ -49,10 +56,10 @@ create_versitygw_acl_user_or_get_direct_user() {
 }
 
 setup_bucket_and_user() {
-  if ! check_param_count "setup_bucket_and_user" "bucket, username, password, user type" 4 $#; then
+  if ! check_param_count_v2 "bucket or prefix, username, password, user type" 4 $#; then
     return 1
   fi
-  if ! setup_bucket "$1"; then
+  if ! setup_bucket_v2 "$1"; then
     log 2 "error setting up bucket"
     return 1
   fi
@@ -64,11 +71,11 @@ setup_bucket_and_user() {
   return 0
 }
 
-setup_bucket_and_user_v2() {
+setup_bucket_and_acl_user() {
   if ! check_param_count_v2 "bucket, username, password" 3 $#; then
     return 1
   fi
-  if ! setup_bucket "$1"; then
+  if ! setup_bucket_v2 "$1"; then
     log 2 "error setting up bucket"
     return 1
   fi
@@ -77,5 +84,102 @@ setup_bucket_and_user_v2() {
     return 1
   fi
   echo "$result"
+  return 0
+}
+
+setup_bucket_file_and_user() {
+  if ! check_param_count "setup_bucket_file_and_user" "bucket, file, username, password, user type" 5 $#; then
+    return 1
+  fi
+  if ! setup_bucket_and_files "$1" "$2"; then
+    log 2 "error setting up bucket and file"
+    return 1
+  fi
+  if ! result=$(setup_user_versitygw_or_direct "$3" "$4" "$5" "$1"); then
+    log 2 "error setting up user"
+    return 1
+  fi
+  echo "$result"
+  return 0
+}
+
+setup_bucket_file_and_user_v2() {
+  if ! check_param_count_v2 "bucket name or prefix, file, username, password, user type" 5 $#; then
+    return 1
+  fi
+  if ! setup_bucket_and_files_v2 "$1" "$2"; then
+    log 2 "error setting up bucket and file"
+    return 1
+  fi
+  if ! result=$(setup_user_versitygw_or_direct "$3" "$4" "$5" "$1"); then
+    log 2 "error setting up user"
+    return 1
+  fi
+  echo "$result"
+  return 0
+}
+
+reset_bucket() {
+  if ! check_param_count "reset_bucket" "bucket" 1 $#; then
+    return 1
+  fi
+  log 6 "reset bucket '$1'"
+
+  if [[ $LOG_LEVEL_INT -ge 5 ]] && ! log_bucket_policy "$1"; then
+    log 3 "error logging bucket policy"
+  fi
+
+  if ! check_object_lock_config "$1"; then
+    log 2 "error checking object lock config"
+    return 1
+  fi
+
+  if [[ "$DIRECT" != "true" ]] && ! add_governance_bypass_policy "$1"; then
+    log 2 "error adding governance bypass policy"
+    return 1
+  fi
+
+  if ! list_and_delete_objects "$1"; then
+    log 2 "error listing and deleting objects"
+    return 1
+  fi
+
+  if ! abort_all_multipart_uploads_rest "$1"; then
+    log 2 "error aborting all multipart uploads"
+    return 1
+  fi
+
+  if [ "$SKIP_ACL_TESTING" != "true" ] && ! check_ownership_rule_and_reset_acl "$1"; then
+    log 2 "error checking ownership rule and resetting acl"
+    return 1
+  fi
+
+  if ! delete_bucket_policy_rest "$1"; then
+    log 2 "error deleting bucket policy"
+    return 1
+  fi
+
+  # shellcheck disable=SC2154
+  if [[ $lock_config_exists == true ]] && ! remove_retention_policy_rest "$1"; then
+    log 2 "error removing bucket retention policy"
+    return 1
+  fi
+
+  if [ "$RUN_USERS" == "true" ] && [ "$DIRECT" != "true" ] && ! change_bucket_owner "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" "$1" "$AWS_ACCESS_KEY_ID"; then
+    log 2 "error changing bucket owner back to root"
+    return 1
+  fi
+}
+
+get_user_id() {
+  if [ "$DIRECT" == "true" ]; then
+    if [ "$DIRECT_AWS_USER_ID" == "" ]; then
+      log 2 "DIRECT_AWS_USER_ID is empty or not defined"
+      return 1
+    fi
+    echo "$DIRECT_AWS_USER_ID"
+    return 0
+  fi
+  echo "$AWS_ACCESS_KEY_ID"
   return 0
 }
