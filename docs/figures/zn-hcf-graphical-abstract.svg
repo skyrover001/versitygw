@@ -1,0 +1,207 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1000" viewBox="0 0 1800 1000" role="img" aria-labelledby="svg-title svg-desc">
+  <title id="svg-title">Coordination-geometry engineering for selective cesium adsorption by trigonal zinc hexacyanoferrate</title>
+  <desc id="svg-desc">DMF-assisted room-temperature co-precipitation transforms cubic octahedral Zn coordination into phase-pure trigonal tetrahedral T-Zn-HCF. Shorter Zn–N bonds and retained vacancies support rigidity and chemical tolerance, while ellipsoidal cavities favor cesium over sodium, magnesium, and calcium. A potassium–cesium ion-exchange schematic and abstract-reported performance metrics are shown.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0 0L10 5L0 10Z" fill="#54728b"/>
+    </marker>
+    <marker id="gold-arrow" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0 0L10 5L0 10Z" fill="#bd8519"/>
+    </marker>
+    <marker id="purple-arrow" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0 0L10 5L0 10Z" fill="#7350a0"/>
+    </marker>
+    <style>
+      text { font-family: Arial, "Noto Sans", sans-serif; fill: #20354b; }
+      .title { font-size: 29px; font-weight: 700; }
+      .subtitle { font-size: 14px; fill: #60758a; }
+      .stage { font-size: 17px; font-weight: 700; }
+      .body { font-size: 14px; }
+      .small { font-size: 12px; fill: #60758a; }
+      .formula { font-size: 17px; font-weight: 600; }
+      .card { fill: #fff; stroke: #d9e3ec; stroke-width: 1.5; }
+      .subcard { fill: #f7fafc; stroke: #e2eaf1; stroke-width: 1.2; }
+      .ion { font-size: 13px; font-weight: 700; text-anchor: middle; dominant-baseline: middle; }
+      .metric-label { font-size: 12px; fill: #60758a; }
+      .metric-value { font-size: 18px; font-weight: 700; }
+    </style>
+  </defs>
+
+  <rect width="1800" height="1000" fill="#fff"/>
+  <text class="title" x="60" y="48">Coordination-geometry engineering unlocks selective Cs⁺ capture</text>
+  <text class="subtitle" x="60" y="74">DMF-induced cubic → trigonal transformation couples framework rigidity, Cs⁺ selectivity, and high adsorption performance</text>
+
+  <rect class="card" x="60" y="105" width="330" height="475" rx="18"/>
+  <circle cx="88" cy="139" r="15" fill="#315d86"/>
+  <text x="88" y="143" font-size="12" font-weight="700" fill="#fff" text-anchor="middle">1</text>
+  <text class="stage" x="114" y="145">DMF-assisted synthesis</text>
+  <text class="small" x="84" y="178">Room-temperature co-precipitation</text>
+  <rect class="subcard" x="82" y="198" width="286" height="77" rx="12"/>
+  <text class="formula" x="225" y="232" text-anchor="middle">
+    K<tspan baseline-shift="sub" font-size="12">4</tspan>[Fe(CN)<tspan baseline-shift="sub" font-size="12">6</tspan>]·3H<tspan baseline-shift="sub" font-size="12">2</tspan>O
+  </text>
+  <text class="small" x="225" y="255" text-anchor="middle">Potassium ferrocyanide trihydrate</text>
+  <circle cx="225" cy="297" r="13" fill="#edf3f7"/>
+  <path d="M219 297h12" stroke="#668096" stroke-width="2" stroke-linecap="round"/>
+  <rect class="subcard" x="82" y="319" width="286" height="77" rx="12"/>
+  <text class="formula" x="225" y="353" text-anchor="middle">
+    Zn(CH<tspan baseline-shift="sub" font-size="12">3</tspan>COO)<tspan baseline-shift="sub" font-size="12">2</tspan>
+  </text>
+  <text class="small" x="225" y="376" text-anchor="middle">Zinc acetate</text>
+  <path d="M190 428h30v17l23 66c4 12-4 21-16 21h-44c-12 0-20-9-16-21l23-66z" fill="#fff" stroke="#52799b" stroke-width="2.5" stroke-linejoin="round"/>
+  <path d="M180 489h51l9 24c2 7-3 12-10 12h-49c-7 0-12-5-10-12z" fill="#cce8ee"/>
+  <path d="M182 494c11-5 20 5 31 0s19-3 23 0" fill="none" stroke="#5bafbd" stroke-width="1.8"/>
+  <path d="M189 428h32M194 421h22" stroke="#52799b" stroke-width="2.5" stroke-linecap="round"/>
+  <text x="265" y="463" font-size="15" font-weight="700" fill="#315d86">DMF</text>
+  <text class="small" x="265" y="483">induces phase</text>
+  <text class="small" x="265" y="500">and coordination</text>
+  <text class="small" x="225" y="560" text-anchor="middle">Simple synthesis → structural redesign</text>
+
+  <path d="M397 340h24" stroke="#54728b" stroke-width="2.5" marker-end="url(#arrow)"/>
+
+  <rect class="card" x="430" y="105" width="680" height="475" rx="18"/>
+  <circle cx="458" cy="139" r="15" fill="#315d86"/>
+  <text x="458" y="143" font-size="12" font-weight="700" fill="#fff" text-anchor="middle">2</text>
+  <text class="stage" x="484" y="145">DMF redirects coordination and crystal phase</text>
+  <text class="small" x="770" y="178" text-anchor="middle">Conceptual coordination diagrams — not crystallographic models</text>
+
+  <text x="590" y="220" text-anchor="middle" font-size="16" font-weight="700">Cubic phase</text>
+  <text class="small" x="590" y="241" text-anchor="middle">Octahedral Zn coordination</text>
+  <g stroke="#91a7b8" stroke-width="3" fill="#fff">
+    <path d="M590 309L590 265M590 309L590 353M590 309L546 309M590 309L634 309"/>
+    <path d="M590 309L559 278M590 309L621 340"/>
+    <circle cx="590" cy="265" r="8"/><circle cx="590" cy="353" r="8"/>
+    <circle cx="546" cy="309" r="8"/><circle cx="634" cy="309" r="8"/>
+    <circle cx="559" cy="278" r="8"/><circle cx="621" cy="340" r="8"/>
+  </g>
+  <circle cx="590" cy="309" r="14" fill="#315d86" stroke="#244561" stroke-width="1.5"/>
+  <text x="590" y="313" font-size="10" font-weight="700" text-anchor="middle" fill="#fff">Zn</text>
+  <text class="small" x="590" y="389" text-anchor="middle">Zn–N coordination number</text>
+  <text x="590" y="412" text-anchor="middle" font-size="17" font-weight="700">5.9</text>
+  <text class="small" x="590" y="434" text-anchor="middle">Zn–N bond length</text>
+  <text x="590" y="457" text-anchor="middle" font-size="17" font-weight="700">1.95 Å</text>
+
+  <path d="M700 309h76" stroke="#54728b" stroke-width="2.5" marker-end="url(#arrow)"/>
+  <text x="738" y="289" text-anchor="middle" font-size="12" font-weight="700" fill="#315d86">DMF</text>
+  <text x="738" y="333" text-anchor="middle" font-size="11" fill="#60758a">redirects</text>
+
+  <text x="865" y="220" text-anchor="middle" font-size="16" font-weight="700">Trigonal T-Zn-HCF</text>
+  <text class="small" x="865" y="241" text-anchor="middle">Tetrahedral Zn coordination</text>
+  <g stroke="#4a858d" stroke-width="3" fill="#fff">
+    <path d="M865 309L865 266M865 309L824 330M865 309L907 330M865 309L865 354"/>
+    <circle cx="865" cy="266" r="8"/><circle cx="824" cy="330" r="8"/>
+    <circle cx="907" cy="330" r="8"/><circle cx="865" cy="354" r="8"/>
+  </g>
+  <circle cx="865" cy="309" r="14" fill="#398a84" stroke="#286d68" stroke-width="1.5"/>
+  <text x="865" y="313" font-size="10" font-weight="700" text-anchor="middle" fill="#fff">Zn</text>
+  <text class="small" x="865" y="389" text-anchor="middle">Zn–N coordination number</text>
+  <text x="865" y="412" text-anchor="middle" font-size="17" font-weight="700" fill="#28776f">3.8</text>
+  <text class="small" x="865" y="434" text-anchor="middle">Zn–N bond length</text>
+  <text x="865" y="457" text-anchor="middle" font-size="17" font-weight="700" fill="#28776f">1.90 Å</text>
+
+  <rect x="958" y="205" width="125" height="196" rx="13" fill="#f1f8f8" stroke="#d6e9e8"/>
+  <text x="1020" y="234" text-anchor="middle" font-size="12" font-weight="700" fill="#397d7b">EXAFS</text>
+  <text x="1020" y="267" text-anchor="middle" font-size="12" fill="#60758a">Coord. no.</text>
+  <text x="1020" y="287" text-anchor="middle" font-size="15" font-weight="700">5.9 → 3.8</text>
+  <text x="1020" y="323" text-anchor="middle" font-size="12" fill="#60758a">Zn–N</text>
+  <text x="1020" y="343" text-anchor="middle" font-size="15" font-weight="700">1.95 → 1.90 Å</text>
+  <path d="M978 361h84" stroke="#d6e4e9"/>
+  <text x="1020" y="383" text-anchor="middle" font-size="11" fill="#60758a">Space group R-3c</text>
+
+  <rect x="462" y="479" width="616" height="72" rx="12" fill="#f7fafc"/>
+  <text x="770" y="507" text-anchor="middle" font-size="14" font-weight="700">Phase-pure trigonal framework</text>
+  <text class="small" x="770" y="531" text-anchor="middle">Shorter Zn–N bonds + tetrahedral geometry preserve vacancies and exchangeable K⁺</text>
+
+  <path d="M1117 340h24" stroke="#54728b" stroke-width="2.5" marker-end="url(#arrow)"/>
+
+  <rect class="card" x="1150" y="105" width="590" height="475" rx="18"/>
+  <circle cx="1178" cy="139" r="15" fill="#315d86"/>
+  <text x="1178" y="143" font-size="12" font-weight="700" fill="#fff" text-anchor="middle">3</text>
+  <text class="stage" x="1204" y="145">Structure directs selective Cs⁺ exchange</text>
+  <text class="small" x="1180" y="178">Ellipsoidal cavity provides a size- and charge-matched host</text>
+
+  <rect x="1190" y="204" width="340" height="220" rx="22" fill="#f2f8f8" stroke="#8ab8bc" stroke-width="1.8"/>
+  <path d="M1225 252L1282 229L1344 250L1403 229L1480 258M1225 252L1236 315L1297 354L1282 229M1236 315L1273 389L1350 391L1297 354L1344 250L1403 229L1463 315L1480 258M1463 315L1403 229M1463 315L1510 367M1350 391L1423 398L1510 367M1273 389L1350 391" fill="none" stroke="#5b9299" stroke-width="2"/>
+  <path d="M1225 252L1297 354M1282 229L1350 391M1344 250L1423 398M1403 229L1350 391M1236 315L1344 250" fill="none" stroke="#9ac2c4" stroke-width="1.4"/>
+  <ellipse cx="1366" cy="313" rx="43" ry="28" fill="#dff0ed" stroke="#398a84" stroke-width="1.7" stroke-dasharray="5 4"/>
+  <circle cx="1366" cy="313" r="18" fill="#f7c95c" stroke="#9d6a08" stroke-width="1.7"/>
+  <text class="ion" x="1366" y="313" fill="#33270b">Cs⁺</text>
+  <text x="1366" y="360" text-anchor="middle" font-size="11" font-weight="700" fill="#398a84">ellipsoidal cavity</text>
+  <g fill="#fff" stroke="#4b858d" stroke-width="2">
+    <circle cx="1225" cy="252" r="6"/><circle cx="1282" cy="229" r="6"/>
+    <circle cx="1344" cy="250" r="6"/><circle cx="1403" cy="229" r="6"/>
+    <circle cx="1480" cy="258" r="6"/><circle cx="1236" cy="315" r="6"/>
+    <circle cx="1297" cy="354" r="6"/><circle cx="1463" cy="315" r="6"/>
+    <circle cx="1510" cy="367" r="6"/><circle cx="1350" cy="391" r="6"/>
+    <circle cx="1423" cy="398" r="6"/><circle cx="1273" cy="389" r="6"/>
+  </g>
+  <text x="1188" y="230" font-size="12" font-weight="700" fill="#bd8519">Cs⁺ in</text>
+  <path d="M1231 235C1265 247 1280 263 1301 279" fill="none" stroke="#bd8519" stroke-width="2.5" marker-end="url(#gold-arrow)"/>
+  <text x="1445" y="414" font-size="12" font-weight="700" fill="#7350a0">K⁺ out</text>
+  <path d="M1422 359C1468 378 1492 392 1527 406" fill="none" stroke="#7350a0" stroke-width="2.5" marker-end="url(#purple-arrow)"/>
+
+  <text class="small" x="1550" y="217">Other ions</text>
+  <circle cx="1577" cy="258" r="15" fill="#65a876" stroke="#3e7951"/>
+  <text class="ion" x="1577" y="258" fill="#fff">Na⁺</text>
+  <circle cx="1630" cy="258" r="17" fill="#53a9aa" stroke="#317778"/>
+  <text class="ion" x="1630" y="258" fill="#fff">Mg²⁺</text>
+  <circle cx="1688" cy="258" r="17" fill="#e2b83e" stroke="#9d7d1c"/>
+  <text class="ion" x="1688" y="258" fill="#33270b">Ca²⁺</text>
+  <text x="1615" y="293" text-anchor="middle" font-size="11" fill="#60758a">DFT: exchange non-spontaneous</text>
+  <text class="small" x="1180" y="456">XPS + near-stoichiometric K⁺ release: K⁺/Cs⁺ ion exchange</text>
+  <text x="1180" y="486" font-size="13" font-weight="700" fill="#315d86">DFT: spontaneous, exothermic Cs⁺ exchange</text>
+  <text x="1180" y="509" font-size="14" font-weight="700">ΔE<tspan baseline-shift="sub" font-size="10">exchange</tspan> = −0.2870 eV</text>
+  <text class="small" x="1180" y="548">Framework and cavity are conceptual schematics, not atomic coordinates</text>
+
+  <path d="M770 594v21M472 615h855" fill="none" stroke="#8ba2b3" stroke-width="1.8"/>
+  <path d="M472 615v16M1327 615v16" stroke="#54728b" stroke-width="2.2" marker-end="url(#arrow)"/>
+  <rect x="60" y="638" width="825" height="105" rx="16" fill="#f1f8f8" stroke="#d8e9e8" stroke-width="1.2"/>
+  <circle cx="105" cy="690" r="22" fill="#dcefed"/>
+  <path d="M94 690h22M105 679v22" stroke="#398a84" stroke-width="2.2" stroke-linecap="round"/>
+  <text x="145" y="680" font-size="15" font-weight="700" fill="#286d68">Rigid, chemically tolerant framework</text>
+  <text class="body" x="145" y="706">Short, strong Zn–N bonds support stability while retaining vacancies and exchangeable K⁺</text>
+  <rect x="915" y="638" width="825" height="105" rx="16" fill="#fff8e8" stroke="#f0e2bd" stroke-width="1.2"/>
+  <circle cx="960" cy="690" r="22" fill="#fff0cc"/>
+  <circle cx="960" cy="690" r="9" fill="#f7c95c" stroke="#9d6a08" stroke-width="1.2"/>
+  <text x="1000" y="680" font-size="15" font-weight="700" fill="#8d6517">Structure-encoded Cs⁺ selectivity</text>
+  <text class="body" x="1000" y="706">Ellipsoidal cavities favor Cs⁺; K⁺/Cs⁺ exchange translates host matching into selective uptake</text>
+
+  <text x="60" y="786" font-size="13" font-weight="700" fill="#60758a" letter-spacing=".3">ADSORPTION PERFORMANCE REPORTED IN THE ABSTRACT</text>
+  <rect class="card" x="60" y="802" width="270" height="146" rx="14"/>
+  <text class="metric-label" x="82" y="832">Cs⁺ capacity (alkaline media)</text>
+  <text class="metric-value" x="82" y="864">622.90 mg·g⁻¹</text>
+  <path d="M82 884h224" stroke="#e4ebf0"/>
+  <text class="metric-label" x="82" y="911">High-capacity uptake</text>
+
+  <rect class="card" x="342" y="802" width="270" height="146" rx="14"/>
+  <text class="metric-label" x="364" y="832">Time to equilibrium</text>
+  <text class="metric-value" x="364" y="864">10 min</text>
+  <path d="M364 884h224" stroke="#e4ebf0"/>
+  <text class="metric-label" x="364" y="911">Rapid adsorption kinetics</text>
+
+  <rect class="card" x="624" y="802" width="270" height="146" rx="14"/>
+  <text class="metric-label" x="646" y="832">pH tolerance / free cyanide</text>
+  <text class="metric-value" x="646" y="864">pH 2–12</text>
+  <path d="M646 884h224" stroke="#e4ebf0"/>
+  <text class="metric-label" x="646" y="911">Free CN⁻ below WHO limit</text>
+
+  <rect class="card" x="906" y="802" width="270" height="146" rx="14"/>
+  <text class="metric-label" x="928" y="832">γ-irradiation resistance</text>
+  <text class="metric-value" x="928" y="864">Up to 200 kGy</text>
+  <path d="M928 884h224" stroke="#e4ebf0"/>
+  <text class="metric-label" x="928" y="911">Structure and capacity essentially unchanged</text>
+
+  <rect class="card" x="1188" y="802" width="270" height="146" rx="14"/>
+  <text class="metric-label" x="1210" y="832">High-salinity performance</text>
+  <text class="metric-value" x="1210" y="864">K⁺ up to 1250 mg·L⁻¹</text>
+  <path d="M1210 884h224" stroke="#e4ebf0"/>
+  <text class="metric-label" x="1210" y="911">K<tspan baseline-shift="sub" font-size="9">d</tspan> &gt; 10⁵ mL·g⁻¹</text>
+
+  <rect class="card" x="1470" y="802" width="270" height="146" rx="14"/>
+  <text class="metric-label" x="1492" y="832">Real-water Cs⁺ removal</text>
+  <text class="metric-value" x="1492" y="864">96.8–98.7%</text>
+  <path d="M1492 884h224" stroke="#e4ebf0"/>
+  <text class="metric-label" x="1492" y="911">Natural, geothermal, seawater</text>
+
+  <text x="60" y="978" font-size="11.5" fill="#718497">Data and mechanistic claims are transcribed from the supplied abstract; coordination and cavity drawings are schematic illustrations.</text>
+</svg>
